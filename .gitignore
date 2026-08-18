@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# 构建产物
+build/
+dist/
+.pyinstaller-build/
+*.spec.bak
+*.obj
+
+# 运行时实例目录（会话/缓存/日志，均属用户数据）
+.max/
+cache-ssd/
+
+# 模型文件（不入库）
+models/
+*.gguf
+*.gguf.*
+
+# 日志与临时
+*.log
+logs/
+
+# IDE / 工具
+.vs/
+.vscode/
+.idea/
+node_modules/
