@@ -24,10 +24,9 @@ Architecture (split 2026-08-19): the engine repo is a **pure platform layer**
 
 **Files**: `tools/server/server-context.cpp`, `tools/server/server-task.h`
 
-- `maybe_gen_checkpoint`: rolling snapshot every `QWENMAX_GEN_CKPT_STEP=256` tokens during decode (threshold-crossing check instead of modulo — MTP multi-token accepts skip modular positions; 2 in-flight snapshots kept). Hooked into **both stop paths** (plain sampling and MTP accept).
-- `maybe_final_checkpoint`: final snapshot when generation ends, so the next turn's n_past goes straight to the end.
+- `maybe_final_checkpoint`: unified end-of-stop snapshot so the next turn's n_past goes straight to the end. Hooked into **both stop paths** — normal stop (decode loop `process_token`) and user interrupt (`SERVER_TASK_TYPE_CANCEL` handler, before `slot.release()`). The interrupt also snapshots, so a cut-off reply stays reusable. No more rolling in-decode snapshots.
 - `retokenize_with_cache`: text-level LCP (UTF-8 boundary fallback, gives up beyond 256 bytes) + shared-prefix cached tokens + tail re-tokenization; **detokenize round-trip verification** — on failure the original tokens are kept. Candidate pool = active slots + RAM states (<=64); SSD joins only on cold start. Heal counters feed into `/cache/stats`.
-- Accompanying: `server_slot::n_decoded_ckpt_last`, `create_checkpoint` identical-skip, `id_task` ownership marking on restore (prevents the min-step rule from re-snapshotting a ~150MiB state repeatedly).
+- Accompanying: `create_checkpoint` identical-skip, `id_task` ownership marking on restore (prevents the min-step rule from re-snapshotting a ~150MiB state repeatedly).
 
 ## C. UMA / Vulkan performance customizations (engine layer, moved to the engine repo)
 

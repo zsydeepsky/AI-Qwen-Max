@@ -43,7 +43,7 @@ Between the frontend and the engine there is only HTTP (OpenAI-compatible plus a
 - Low-memory proactive eviction: `POST /cache/evict?ram_target_mib=N` (persist, not drop).
 
 ### 3.3 Generation checkpoints + BPE heal (the two guardians of cache hits)
-- Hybrid architectures (SSM+attention) roll back via checkpoints, not KV shift. Upstream only builds checkpoints during the prompt phase, so last turn's reply got fully recomputed the next turn. Custom: rolling snapshot every 256 tokens during decode (2 kept) + a final snapshot when generation ends.
+- Hybrid architectures (SSM+attention) roll back via checkpoints, not KV shift. Upstream only builds checkpoints during the prompt phase, so last turn's reply got fully recomputed the next turn. Custom: a unified final snapshot on every stop path — normal end (decode loop) and user interrupt (CANCEL) both snapshot prompt+generated content right before releasing the slot; no in-decode rolling snapshots (saves ~0.4% decode throughput).
 - Greedy per-token output vs whole-segment re-tokenization can disagree on BPE boundaries, defeating token-level LCP. Custom: retokenize_with_cache (text-level LCP + detokenize round-trip check); candidate pool = active slots + RAM states (SSD participates only on cold start).
 
 ### 3.4 Speculative decoding: DFlash2 (standalone draft model, replacing MTP)

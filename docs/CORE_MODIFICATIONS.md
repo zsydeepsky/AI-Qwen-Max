@@ -89,35 +89,31 @@ if (!data_drft.empty()) {
 
 这是本工程缓存体系的两个"隐性支柱"：一个解决"长回复后缓存死"，一个解决"编辑/重渲染后缓存死"。二者独立，但都服务于同一个目标：**让 55× TTFT 缓存收益在真实交互中存活**。
 
-### 2.1 生成段 checkpoint（`maybe_gen_checkpoint` / `maybe_final_checkpoint`）
+### 2.1 生成段 checkpoint（`maybe_final_checkpoint`）
 
 **问题**：上游 `create_checkpoint` 只在处理 prompt 时拍照（用户消息边界 + prompt 尾部），生成（decode）阶段不拍照。而 hybrid/循环模型 decode 后序列头（`pos_min`）滚到生成内容上，下一轮请求的恢复过滤器（`pos_max > pos_next` 才有效）把所有 checkpoint 判为无效 → 只能回退到"生成起点之前的 prompt 尾部" → **整段上轮回复重新 prefill**（"cache dies after every long reply"）。
 
-**机制**：
+**机制**：停止路径统一终拍——释放 slot 前把当前 KV（= prompt + 已生成内容）拍成 checkpoint，下轮从精确停止点恢复。两条停止路径都挂：
 
 ```text
-第 1 轮： [prompt 历史] [上游在此拍照] [模型生成长回复..........]
-                                        ↑ 每 QWENMAX_GEN_CKPT_STEP token 滚一张
-                                        ↑ 结束时 maybe_final_checkpoint 收尾一张
-第 2 轮： 从最终快照（= prompt + 生成内容）恢复，不再重算
+第 1 轮： [prompt 历史] [上游在此拍照] [模型生成长回复...........]
+                                         │ 正常结束 → 终拍一张
+第 1'轮：[prompt 历史] [……半截回复……]   ← 用户按 ESC / 客户端断开
+                                         │ 中断 → 也终拍一张
+第 2 轮： 从终拍快照（= prompt + 完整/半截生成内容）恢复，不再重算
 ```
 
-三个实现要点：
+实现要点：
 
-1. **threshold crossing 而非 modulo**：MTP 投机解码一次验证接受多个 token，`n_decoded` 会跳过取模位置，所以用"差值超过 STEP"判断：
-   ```cpp
-   if (slot.n_decoded - slot.n_decoded_ckpt_last < QWENMAX_GEN_CKPT_STEP) return;
-   slot.n_decoded_ckpt_last = slot.n_decoded;
-   ```
-2. **滚动淘汰**：只保留最新 `QWENMAX_GEN_CKPT_KEEP` 张生成段快照（`n_tokens > n_prompt_task` 判定为生成段），老的最先删。
-3. **两条 decode 路径都要调**：普通采样分支和投机（MTP）接受分支——MTP 开启时普通分支提前返回，漏调则整条链失效。
-4. **`create_checkpoint` 跳过优化**：最新快照已是同任务、同 `pos_max`、同 token 数（例如刚从快照恢复还没生成新 token）时跳过拍照，省 ~150MiB 读回：
+1. **正常收尾路径**：decode 循环内 `process_token()` 返回停止（EOS / stop 串 / 达 max tokens）→ `maybe_final_checkpoint(slot)` → `slot.release()`。两条 decode 分支（plain sampling 与投机接受）都覆盖。
+2. **中断路径（本机制新增）**：客户端断开 SSE / ESC / abort 会投递 `SERVER_TASK_TYPE_CANCEL` 任务，其处理器在 `slot.release()` **之前**调用 `maybe_final_checkpoint(slot)`——中断那一刻的 KV 状态被定格，半截回复下轮可续写，不再回滚重 prefill。
+3. **`create_checkpoint` 跳过优化**：最新快照已是同任务、同 `pos_max`、同 token 数（例如刚从快照恢复还没生成新 token）时跳过拍照，省 ~150MiB 读回：
    ```cpp
    if (newest.id_task == id_task && newest.pos_max == pos_max &&
        newest.n_tokens == (int64_t)(slot.prompt.n_tokens() - n_tokens_cur)) return;
    ```
 
-**成本**：每张快照 ~150MiB 显存→RAM 读回（hybrid 模型），step 256 时约 0.4% decode 吞吐。
+**成本**：每次停止一次 ~150MiB 显存→RAM 读回（hybrid 模型）。早期版本的"解码期每 256 token 滚动快照 + 保留 2 份"已移除——正常收尾与中断都能精确终拍后，滚动快照不再必要（省 ~0.4% decode 吞吐 + 读回停顿）。
 
 **为什么平台特化**：RAM 管够 + 需要"长回复后下一轮免重算"的极端会话场景。大众设备上额外几百 MB RAM + 读回停顿可能挤垮推理栈。**上提评估：不普适，留本地。**
 

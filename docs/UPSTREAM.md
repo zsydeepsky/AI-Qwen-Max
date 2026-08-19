@@ -32,7 +32,7 @@
 | # | 内容 | 位置 | 上游现状 | 建议 | 状态 |
 |---|---|---|---|---|---|
 | 1 | SSD 两级 prompt 缓存（`--cache-ssd`） | `tools/server/` + `common/` | 上游仅 `--cache-ram`；PR #26408（`--cache-disk`，UMA offload）已关闭未合并；issue #20697 开放 | 大件；对齐 #26408 设计后上提，或至少贡献设计 | 🟡 |
-| 2 | 生成段 checkpoint + BPE 治愈（`retokenize_with_cache`） | `server-context/task` | 上游有 `--ctx-checkpoints`（SWA/循环模型） | 先与上游 ctx-checkpoints 对照，删重叠、留独有 | 🟡 |
+| 2 | 生成段收尾/中断 checkpoint + BPE 治愈（`retokenize_with_cache`） | `server-context/task` | 上游有 `--ctx-checkpoints`（SWA/循环模型） | 先与上游 ctx-checkpoints 对照，删重叠、留独有 | 🟡 |
 | 3 | `POST /max/shutdown`（HTTP 触发干净退出） | `tools/server/server.cpp` | 上游仅信号式 shutdown | **判定私有、不上提**（无鉴权 shutdown 是公网攻击面）；仅本地 loopback 使用 | 🔵 |
 | 4 | `has_mtmd` 语义修复（per-prompt 媒体检查） | server-common/task/context | 上游两层面均为 `!has_mtmd`（未吸收） | 独有保留；断言部分剥离 SSD 依赖后可作小 PR | 🔵 |
 | 5 | qwen3_coder 工具调用解析容错 | `common/chat.cpp` | 官方 master 已重构通用 parser；strix-halo-vulkan 仍旧 parser | 待 strix-halo 同步 master 后重核 | 🔵 |
@@ -46,8 +46,8 @@
 |---|---|---|
 | `server_prompt_cache::alloc/update/load/destroy` | SSD 层 save/load/teardown | 上游改动此三类时优先检查（见 ENGINE_PATCHES.md 注意事项）|
 | `llama_server::terminate` / 信号 shutdown 路径 | `/max/shutdown` wrap | 钩子应只剩路由注册 |
-| `process_single_task` / decode 路径 | 生成段 checkpoint（`maybe_gen_checkpoint`/`maybe_final_checkpoint`） | 上游重构 server 任务循环时重点核对 |
-| `server_slot` 结构 | `n_decoded`/`n_decoded_ckpt_last` 字段 | 上游改 slot 字段时核对（曾与上游 `n_remaining()` 方法同名冲突） |
+| `process_single_task` / decode 路径 | 生成段 checkpoint（`maybe_final_checkpoint`：正常收尾 + CANCEL 中断） | 上游重构 server 任务循环时重点核对 |
+| `server_slot` 结构 | `n_decoded` 字段 | 上游改 slot 字段时核对（曾与上游 `n_remaining()` 方法同名冲突） |
 | `server_tokens::get_tokens/set_token` | has_mtmd 断言修复（C03） | 上游断言改动时核对 |
 
 ## 四、已确认的重复（本地实现应删除，改用上游）
@@ -92,19 +92,17 @@
 **上游关系：** 独有。上游只有 RAM 层（`--cache-ram`）；磁盘缓存上游 PR #26408 已关闭、issue #20697 开放，方向一致但未合并。
 **核对/重做要点：** 核心类已在独立文件（`ssd-prompt-cache.h/.cpp`），上游文件只留 `ssd` 指针 + 4 个钩子（load/update/evict/flush），合并债 O(钩子)。上提候选 #1。
 
-### C02 生成段 checkpoint（滚动/收尾）+ BPE 治愈（`retokenize_with_cache`）
+### C02 生成段 checkpoint（收尾/中断）+ BPE 治愈（`retokenize_with_cache`）
 
 **修改文件与方法：**
 - `tools/server/server-context.cpp`：
-  - `maybe_gen_checkpoint(slot)` — 生成途中按 `QWENMAX_GEN_CKPT_STEP` 滚动存 checkpoint（两条 decode 路径都调用）；`maybe_final_checkpoint(slot)` — 生成结束收尾存
+  - `maybe_final_checkpoint(slot)` — 停止路径统一收尾存 checkpoint：正常结束（decode 循环内 `process_token` 返回停止）与用户中断（`SERVER_TASK_TYPE_CANCEL` 处理器里 `slot.release()` 之前）都调用。不再有解码期滚动快照（已移除 `maybe_gen_checkpoint`）
   - `create_checkpoint` — checkpoint 内容与最新一份相同时跳过（以 id_task 归属标记避免 min-step 重快照；hybrid 快照约 150MiB 成本）
-  - `server_slot::n_decoded_ckpt_last` — 新字段
   - `server_context_impl::retokenize_with_cache(task)` — 文本级 LCP 治愈：新请求与缓存候选做 **detokenize 后文本** 前缀比对 → 前缀 token 复用 + 尾部重新 `common_tokenize` → 再 detokenize 校验一致性；失败回退原 tokens
-- env：`QWENMAX_GEN_CKPT_STEP` / `QWENMAX_GEN_CKPT_KEEP`
 - `tools/server/server-task.h` — `task_params::message_delimiters`；decode 后保留 delimiters，供 `retokenize_with_cache` 重算 `message_spans`
 
-**原因与意图：** ① 同 slot 多次生成时，从生成起点 checkpoint 恢复，长回复局部编辑不再全量重算 KV；② 缓存复用靠 token 级 LCP，但 `common_tokenize` 倾向多字符合并，同一文本的两次 tokenize 可能不同 → 命中失效；用文本级 LCP 治愈。
-**上游关系：** 部分重叠。上游有 `--ctx-checkpoints`/`--checkpoint-min-step`（面向 SWA/循环模型上下文）；"生成段滚动 checkpoint" 与 "文本级 BPE 治愈" 为独有。上提候选 #2。
+**原因与意图：** ① 同 slot 多次生成时，从生成终点/中断点 checkpoint 恢复，长回复与"半截回复"局部编辑不再全量重算 KV；② 缓存复用靠 token 级 LCP，但 `common_tokenize` 倾向多字符合并，同一文本的两次 tokenize 可能不同 → 命中失效；用文本级 LCP 治愈。
+**上游关系：** 部分重叠。上游有 `--ctx-checkpoints`/`--checkpoint-min-step`（面向 SWA/循环模型上下文）；"生成收尾/中断 checkpoint" 与 "文本级 BPE 治愈" 为独有。上提候选 #2。
 **核对/重做要点：** 先对照上游 `--ctx-checkpoints` 实现删重叠；独有部分重写时优先放新文件，挂 `create_checkpoint`/decode 路径钩子。
 
 ### C03 has_mtmd 语义修复（断言级）+ find_next_media_chunk 守卫 — 2026-08-19 已审计

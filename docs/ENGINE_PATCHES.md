@@ -23,10 +23,9 @@
 
 **文件**：`tools/server/server-context.cpp`、`tools/server/server-task.h`
 
-- `maybe_gen_checkpoint`：解码期每 `QWENMAX_GEN_CKPT_STEP=256` token 滚动快照（阈值交叉判断而非 modulo——MTP 多 token 接受会跳过模位置；保留 2 份段内快照）。**两条 stop 路径都挂**（plain sampling 与 MTP accept）。
-- `maybe_final_checkpoint`：生成结束终拍，下一轮 n_past 直达末尾。
+- `maybe_final_checkpoint`：停止路径统一收尾快照，下一轮 n_past 直达末尾。两条停止路径都挂——正常结束（decode 循环 `process_token` 停止）与用户中断（`SERVER_TASK_TYPE_CANCEL` 处理器，`slot.release()` 之前）。中断也终拍，保证"半截回复"可续复用。不再有解码期滚动快照。
 - `retokenize_with_cache`：文本级 LCP（UTF-8 边界回退，<256 字节放弃）+ 共享前缀缓存 token + 尾部重 tokenize；**detokenize 往返校验**失败则保留原 tokens。候选池 = 活跃 slots + RAM states（≤64），SSD 仅冷启动参与。治愈计数进 `/cache/stats`。
-- 配套：`server_slot::n_decoded_ckpt_last`、`create_checkpoint` identical-跳过、restore 时 `id_task` 归属标记（防 min-step 规则反复重拍 ~150MiB 状态）。
+- 配套：`create_checkpoint` identical-跳过、restore 时 `id_task` 归属标记（防 min-step 规则反复重拍 ~150MiB 状态）。
 
 ## C. UMA / Vulkan 性能定制（引擎层，已迁至引擎仓库）
 

@@ -43,7 +43,7 @@ L1  推理引擎     llama-server（:8081 子进程，vendor/llama.cpp ryzen-uma
 - 低内存主动驱逐：`POST /cache/evict?ram_target_mib=N`（persist 不 drop）。
 
 ### 3.3 生成段 checkpoint + BPE 治愈（缓存命中的两大保镖）
-- 混合架构（SSM+attention）回滚依赖 checkpoint 而非 KV shift。上游只在 prompt 期建 checkpoint → 上一轮回复在下轮被整体重算。定制：解码期每 256 token 滚动快照（保留 2 份）+ 生成结束终拍。
+- 混合架构（SSM+attention）回滚依赖 checkpoint 而非 KV shift。上游只在 prompt 期建 checkpoint → 上一轮回复在下轮被整体重算。定制：停止路径统一终拍——正常收尾（decode 循环）与用户中断（CANCEL）都在释放 slot 前存一张覆盖 prompt+生成内容的快照；无解码期滚动快照（省 ~0.4% decode 吞吐）。
 - 贪心生成逐 token 输出与重渲染整段 tokenize 的 BPE 边界分歧会击穿 token 级 LCP。定制：retokenize_with_cache（文本级 LCP + detokenize 往返校验），候选池 = 活跃 slot + RAM states（SSD 仅冷启动时参与）。
 
 ### 3.4 投机解码：DFlash2（独立草稿模型，取代 MTP）

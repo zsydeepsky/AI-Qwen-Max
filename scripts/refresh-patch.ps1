@@ -40,8 +40,15 @@ $files = @(
 # 不包含 untracked 文件，先用 intent-to-add 标记让 diff 把它作为新文件导出。
 git -C $llamaDir add -N tools/server/ssd-prompt-cache.cpp tools/server/ssd-prompt-cache.h
 
-git -C $llamaDir diff origin/strix-halo-vulkan -- $files > $patchPath
+# 导出 diff。注意：PowerShell 5.1 的 `>` 重定向 native 命令输出默认写 UTF-16LE，
+# git apply 无法解析，必须显式以 UTF-8 无 BOM 落盘。
+$diffText = & git -C $llamaDir diff origin/strix-halo-vulkan -- $files
 if ($LASTEXITCODE -ne 0) { throw 'git diff 失败（检查 origin/strix-halo-vulkan 引用是否存在）。' }
+if ($null -eq $diffText -or ($diffText -is [string] -and [string]::IsNullOrEmpty($diffText)) -or ($diffText -is [System.Array] -and $diffText.Count -eq 0)) {
+    throw 'git diff 为空：工作区相对基线无差异，请检查 $files 清单。'
+}
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText($patchPath, (($diffText -join "`n") + "`n"), $utf8NoBom)
 
 # 校验：补丁应能从纯化引擎干净应用
 # tracked 文件恢复为 origin 版本；ssd-prompt-cache.* 在 origin 中不存在
@@ -49,10 +56,15 @@ if ($LASTEXITCODE -ne 0) { throw 'git diff 失败（检查 origin/strix-halo-vul
 $tracked = $files | Where-Object { $_ -notmatch '^tools/server/ssd-prompt-cache' }
 git -C $llamaDir checkout -q origin/strix-halo-vulkan -- $tracked
 Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $llamaDir 'tools\server\ssd-prompt-cache.cpp'), (Join-Path $llamaDir 'tools\server\ssd-prompt-cache.h')
+# 清理 intent-to-add 残留：此前 add -N 让 index 持有空条目，git apply 会把它
+# 当作"新文件已存在"，导致新文件 diff 报 No valid patches。校验前必须先 reset。
+git -C $llamaDir reset -q -- tools/server/ssd-prompt-cache.cpp tools/server/ssd-prompt-cache.h
 git -C $llamaDir apply --check $patchPath
 if ($LASTEXITCODE -ne 0) {
-    git -C $llamaDir checkout -q HEAD -- .
-    throw "补丁校验失败：无法从纯化引擎应用。请修正产品层定制后重试。"
+    Write-Error "补丁校验失败：无法从纯化引擎应用。请修正产品层定制后重试。"
+    Write-Error "工作区当前为纯化状态（tracked 已还原、ssd 文件已删除），不再自动还原以免误毁未导出修改。"
+    Write-Error "恢复命令：git -C vendor\llama.cpp apply $patchPath"
+    exit 1
 }
 # 恢复工作区（补丁已应用）
 git -C $llamaDir apply $patchPath

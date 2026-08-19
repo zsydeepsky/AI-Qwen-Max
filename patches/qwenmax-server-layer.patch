@@ -160,7 +160,7 @@ index 7ed4865..19f1791 100644
  }
  
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index 1bef40a..681b37f 100644
+index 1bef40a..265f3fe 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -6,6 +6,7 @@
@@ -171,7 +171,7 @@ index 1bef40a..681b37f 100644
  
  #include "build-info.h"
  #include "common.h"
-@@ -37,8 +38,74 @@
+@@ -37,6 +38,65 @@
  
  using json = nlohmann::ordered_json;
  
@@ -236,17 +236,8 @@ index 1bef40a..681b37f 100644
 +
  constexpr int HTTP_POLLING_SECONDS = 1;
  
-+// QwenMax: generation-segment rolling checkpoints (see the decode-loop comment).
-+// [QwenMax C02 merge-strategy] compare against upstream --ctx-checkpoints /
-+// --checkpoint-min-step on every rebase, drop the overlap, keep the rolling
-+// generation-segment part (no upstream equivalent).
-+constexpr int64_t QWENMAX_GEN_CKPT_STEP = 256; // snapshot every N decoded tokens
-+constexpr size_t  QWENMAX_GEN_CKPT_KEEP = 2;   // generation checkpoints kept per slot
-+
  static common_speculative_output_limits server_output_limits(const common_params & params) {
-     if (params.embedding ||
-             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
-@@ -224,9 +291,14 @@ struct server_slot {
+@@ -224,9 +284,10 @@ struct server_slot {
      int64_t t_last_used = -1;
  
      // generation props
@@ -256,15 +247,11 @@ index 1bef40a..681b37f 100644
 +    int32_t n_ctx       = 0;  // context size per slot
 +    int32_t n_keep      = 0;
 +    int32_t n_decoded   = 0;
-+    // QwenMax: n_decoded value when the last generation-segment checkpoint was
-+    // taken. MTP accepts 2-3 tokens per decode step, so n_decoded skips multiples
-+    // of the checkpoint step - a modulo test never fires. Track the distance instead.
-+    int32_t n_decoded_ckpt_last = 0;
 +    int32_t i_batch     = -1;
  
      // effective generation limit for the current task, -1 means unlimited
      int32_t n_predict_max = -1;
-@@ -279,8 +351,11 @@ struct server_slot {
+@@ -279,8 +340,11 @@ struct server_slot {
          return true;
      }
  
@@ -278,7 +265,7 @@ index 1bef40a..681b37f 100644
          if (!res) {
              SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
          }
-@@ -820,6 +895,13 @@ public:
+@@ -820,6 +884,13 @@ public:
          }
      }
  
@@ -292,7 +279,7 @@ index 1bef40a..681b37f 100644
  private:
      // note: accessing these fields outside of this class is not thread-safe
      // use server_context methods instead
-@@ -860,6 +942,17 @@ private:
+@@ -860,6 +931,17 @@ private:
  
      std::unique_ptr<server_prompt_cache> prompt_cache;
  
@@ -310,7 +297,7 @@ index 1bef40a..681b37f 100644
      server_metrics metrics;
  
      // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
-@@ -882,6 +975,19 @@ private:
+@@ -882,6 +964,19 @@ private:
      int64_t t_last_load_progress_ms = 0;
  
      void destroy() {
@@ -330,7 +317,7 @@ index 1bef40a..681b37f 100644
          spec.reset();
          spec_init.reset();
  
-@@ -1258,6 +1364,9 @@ private:
+@@ -1258,6 +1353,9 @@ private:
  
              slot.mctx                   = mctx;
              slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -340,7 +327,7 @@ index 1bef40a..681b37f 100644
  
              SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
  
-@@ -1310,8 +1419,80 @@ private:
+@@ -1310,8 +1408,80 @@ private:
              SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
  
              prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
@@ -421,7 +408,7 @@ index 1bef40a..681b37f 100644
          }
          SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
  
-@@ -1486,6 +1667,149 @@ private:
+@@ -1486,6 +1656,149 @@ private:
          return nullptr;
      }
  
@@ -571,7 +558,7 @@ index 1bef40a..681b37f 100644
      server_slot * get_available_slot(const server_task & task) {
          server_slot * ret = nullptr;
  
-@@ -1588,7 +1912,10 @@ private:
+@@ -1588,7 +1901,10 @@ private:
  
                  ret->prompt_save(*prompt_cache);
  
@@ -583,7 +570,7 @@ index 1bef40a..681b37f 100644
                      ret->prompt_clear();
                  }
  
-@@ -2244,6 +2571,20 @@ private:
+@@ -2244,6 +2560,20 @@ private:
      void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
          const int id_task = slot.task->id;
  
@@ -604,7 +591,7 @@ index 1bef40a..681b37f 100644
          // evict checkpoints within min-step of a previous checkpoint, unless they were
          // created by the current task
          int64_t last = -1;
-@@ -2279,10 +2620,19 @@ private:
+@@ -2279,10 +2609,19 @@ private:
          //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
          cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
  
@@ -624,85 +611,24 @@ index 1bef40a..681b37f 100644
  
          SLT_TRC(slot,
                  "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-@@ -2290,6 +2640,96 @@ private:
+@@ -2290,6 +2629,35 @@ private:
                  cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
      }
  
-+    // QwenMax: rolling checkpoints over the generated segment.
-+    //
-+    // Upstream creates context checkpoints only while processing the prompt
-+    // (user-message boundaries + prompt tail). After a hybrid/recurrent model
-+    // decodes, pos_min rises to the sequence head, so every next turn rolls
-+    // the state back to the newest checkpoint - which sits at the *prompt
-+    // tail*, before the generation - and re-prefills the entire previous
-+    // reply. A long answer costs the user tens of seconds on the next turn.
-+    //
-+    // Snapshot every QWENMAX_GEN_CKPT_STEP decoded tokens, keeping only
-+    // the newest QWENMAX_GEN_CKPT_KEEP of them (~150 MiB readback per
-+    // snapshot on hybrid models; ~0.4% decode throughput at step 256).
-+    //
-+    // Must be called from BOTH decode paths: the plain-sampling branch and the
-+    // speculative (MTP) accept branch - with draft-mtp enabled the plain branch
-+    // returns early and never runs.
-+    void maybe_gen_checkpoint(server_slot & slot) {
-+        // [QwenMax C02 merge-strategy] rolling generation-segment checkpoints -
-+        // no upstream equivalent (upstream --ctx-checkpoints only covers prompt
-+        // segments); keep. Called from both decode paths, re-check call sites.
-+        // QwenMax: actual-media check (has_mtmd is unreliable once mmproj loaded)
-+        if (params_base.n_ctx_checkpoints <= 0 || slot.prompt.tokens.find_next_media_chunk(0).first != nullptr) {
-+            return;
-+        }
-+
-+        // threshold crossing (not modulo): MTP accepts multiple tokens per
-+        // verify step, so n_decoded skips over modulo positions
-+        if (slot.n_decoded - slot.n_decoded_ckpt_last < QWENMAX_GEN_CKPT_STEP) {
-+            return;
-+        }
-+
-+        slot.n_decoded_ckpt_last = slot.n_decoded;
-+
-+        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-+        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
-+
-+        if (pos_min < 0) {
-+            return;
-+        }
-+
-+        // trim generation-segment checkpoints (those covering tokens past
-+        // this task's prompt input) down to KEEP - 1, oldest first
-+        const int64_t n_prompt_task = slot.task->n_tokens();
-+
-+        size_t n_gen = 0;
-+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
-+            if (it->n_tokens > n_prompt_task && ++n_gen >= QWENMAX_GEN_CKPT_KEEP) {
-+                SLT_TRC(slot, "erasing old generation checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
-+                        it->pos_min, it->pos_max, it->n_tokens);
-+
-+                it = slot.prompt.checkpoints.erase(it);
-+            } else {
-+                ++it;
-+            }
-+        }
-+
-+        create_checkpoint(slot, 0, pos_min, pos_max);
-+    }
-+
-+    // QwenMax: snapshot at generation end.
-+    //
-+    // A rolling generation checkpoint is taken mid-reply (every
-+    // QWENMAX_GEN_CKPT_STEP tokens), so its pos_max is always at or beyond
-+    // the pos_next of the next turn's request - the restore filter
-+    // (pos_max > pos_next => invalid) rejects it and the next turn rolls back
-+    // to the previous prompt-tail checkpoint, re-prefilling the whole reply.
-+    // This is the "cache dies after every long reply" effect.
++    // QwenMax: snapshot at generation end / interruption.
 +    //
 +    // The final snapshot covers exactly the prompt + generated tokens, i.e.
 +    // the state the next re-rendered request starts from (once cache-aware
-+    // re-tokenization aligns the prompt). It must be taken on every stop path.
++    // re-tokenization aligns the prompt). It must be taken on every stop path:
++    // - normal stop (EOS / stop string / max tokens): taken in the decode loop
++    //   right before release;
++    // - user interrupt (SSD/SLOT abort -> CANCEL task): taken in the CANCEL
++    //   handler before release, so the interrupted prefix stays reusable and the
++    //   next request resumes from the cut-off point instead of re-prefilling
++    //   the whole reply.
 +    void maybe_final_checkpoint(server_slot & slot) {
-+        // [QwenMax C02 merge-strategy] final checkpoint at generation end (rolls
-+        // the segment checkpoint forward to the exact stop position); keep with
-+        // maybe_gen_checkpoint.
++        // [QwenMax C02 merge-strategy] final checkpoint at generation end /
++        // interrupt (no upstream equivalent for the interrupt path; keep).
 +        // QwenMax: actual-media check (has_mtmd is unreliable once mmproj loaded)
 +        if (params_base.n_ctx_checkpoints <= 0 || slot.prompt.tokens.find_next_media_chunk(0).first != nullptr) {
 +            return;
@@ -721,7 +647,7 @@ index 1bef40a..681b37f 100644
      // returns false to decline the task, it is offered again after the decode is done
      bool process_single_task(server_task && task, bool is_yielding) {
          // while yielding, an encode / decode is running and only accessing metrics is safe
-@@ -2314,6 +2754,10 @@ private:
+@@ -2314,6 +2682,10 @@ private:
  
                      const int id_task = task.id;
  
@@ -732,7 +658,20 @@ index 1bef40a..681b37f 100644
                      server_slot * slot = get_available_slot(task);
  
                      //
-@@ -2862,7 +3306,8 @@ private:
+@@ -2375,6 +2747,12 @@ private:
+                     // release slot linked with the task id
+                     for (auto & slot : slots) {
+                         if (slot.task && slot.task->id == task.id_target) {
++                            // QwenMax: user interrupt (ESC / client disconnect / abort)
++                            // lands here. Snapshot the current KV state before releasing
++                            // so the interrupted prefix stays cached and the next request
++                            // resumes from the cut-off point instead of re-prefilling
++                            // the whole reply.
++                            maybe_final_checkpoint(slot);
+                             slot.release();
+                             break;
+                         }
+@@ -2862,7 +3240,8 @@ private:
                  // add generated tokens to cache
                  // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
                  {
@@ -742,7 +681,7 @@ index 1bef40a..681b37f 100644
  
                      llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
                      for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
-@@ -3139,7 +3584,8 @@ private:
+@@ -3139,7 +3518,8 @@ private:
  
                                  const bool can_cache_reuse =
                                      llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
@@ -752,7 +691,7 @@ index 1bef40a..681b37f 100644
  
                                  if (!can_cache_reuse && n_cache_reuse > 0) {
                                      SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
-@@ -3147,7 +3593,7 @@ private:
+@@ -3147,7 +3527,7 @@ private:
  
                                  // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                  if (can_cache_reuse && n_cache_reuse > 0) {
@@ -761,7 +700,7 @@ index 1bef40a..681b37f 100644
  
                                      size_t head_c = n_past; // cache
                                      size_t head_p = n_past; // current prompt
-@@ -3282,6 +3728,12 @@ private:
+@@ -3282,6 +3662,12 @@ private:
                                          // restore the draft's speculative state
                                          common_speculative_set_state(spec.get(), slot.id, it->data_spec);
  
@@ -774,7 +713,7 @@ index 1bef40a..681b37f 100644
                                          pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                          n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
                                          SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
-@@ -3383,6 +3835,12 @@ private:
+@@ -3383,6 +3769,12 @@ private:
                              ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                              n_swa > 0);
  
@@ -787,19 +726,18 @@ index 1bef40a..681b37f 100644
                      bool has_mtmd = false;
  
                      // check if we should process the mtmd chunk
-@@ -3507,8 +3965,10 @@ private:
+@@ -3507,8 +3899,9 @@ private:
                          // extract the logits only for the last token
                          batch.set_output(batch.size() - 1, true);
  
 +                        slot.n_decoded = 0;
-+                        slot.n_decoded_ckpt_last = 0;
                          slot.stats.n_gen = 0;
 -                        slot.i_batch     = batch.size() - 1;
 +                        slot.i_batch   = batch.size() - 1;
  
                          slot.init_sampler();
                      } else {
-@@ -3795,12 +4255,16 @@ private:
+@@ -3795,6 +4188,7 @@ private:
              if (!process_token(result, slot)) {
                  // release slot because of stop condition
                  slot.print_timings();
@@ -807,16 +745,7 @@ index 1bef40a..681b37f 100644
                  send_final_response(slot);
                  slot.release();
  
-                 return;
-             }
- 
-+            // QwenMax: rolling generation-segment checkpoint (see maybe_gen_checkpoint)
-+            maybe_gen_checkpoint(slot);
-+
-             slot.print_timings_tg();
-         });
- 
-@@ -3923,6 +4387,7 @@ private:
+@@ -3923,6 +4317,7 @@ private:
  
                  if (!process_token(result, slot)) {
                      slot.print_timings();
@@ -824,19 +753,7 @@ index 1bef40a..681b37f 100644
                      send_final_response(slot);
                      slot.release();
  
-@@ -3930,6 +4395,11 @@ private:
-                 }
-             }
- 
-+            // QwenMax: rolling generation-segment checkpoint (see maybe_gen_checkpoint).
-+            // This is the decode path actually taken with draft-mtp enabled - the plain
-+            // sampling branch above returns early when speculating.
-+            maybe_gen_checkpoint(slot);
-+
-             slot.print_timings_tg();
- 
-             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
-@@ -4230,6 +4700,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+@@ -4230,6 +4625,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                      data);
  
              task.params.message_spans = task.tokens.find_message_spans(delimiters);
@@ -846,7 +763,7 @@ index 1bef40a..681b37f 100644
  
              task.id_slot = json_value(data, "id_slot", -1);
              sse_ping_interval = task.params.sse_ping_interval;
-@@ -4437,6 +4910,86 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
+@@ -4437,6 +4835,86 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
      return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
  }
  
@@ -933,7 +850,7 @@ index 1bef40a..681b37f 100644
  server_routes::server_routes(const common_params & params, server_context & ctx_server)
          : params(params),
            ctx_server(*ctx_server.impl),
-@@ -4543,6 +5096,42 @@ void server_routes::init_routes() {
+@@ -4543,6 +5021,42 @@ void server_routes::init_routes() {
          return res;
      };
  
