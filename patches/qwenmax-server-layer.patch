@@ -1,0 +1,1922 @@
+﻿diff --git a/common/arg.cpp b/common/arg.cpp
+index 49b3380..4dfddf0 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1710,6 +1710,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_mib = value;
+         }
+     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"-cssd", "--cache-ssd"}, "N",
++        // [QwenMax C01 merge-strategy] SSD prompt-cache tier (local extension, no
++        // upstream equivalent - upstream PR #26408 --cache-disk was closed); keep.
++        string_format("set the maximum SSD prompt cache size in MiB (default: %d, 0 - disable, -1 - no limit)"
++            " - evicted RAM cache states are persisted to disk and restored across restarts", params.cache_ssd_mib),
++        [](common_params & params, int value) {
++            params.cache_ssd_mib = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_SSD").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-ssd-ttl-hours"}, "N",
++        string_format("remove SSD prompt cache entries not used for N hours (default: %d, 0 - disable)"
++            " - lazy cleanup on init/save/load", params.cache_ssd_ttl_hours),
++        [](common_params & params, int value) {
++            params.cache_ssd_ttl_hours = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_SSD_TTL_HOURS").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"-cssdp", "--cache-ssd-path"}, "DIR",
++        string_format("directory for the SSD prompt cache (default: '%s')",
++            params.cache_ssd_path.empty() ? "prompt-cache-ssd" : params.cache_ssd_path.c_str()),
++        [](common_params & params, const std::string & value) {
++            params.cache_ssd_path = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_SSD_PATH").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-kvu", "--kv-unified"},
+         {"-no-kvu", "--no-kv-unified"},
+diff --git a/common/chat.cpp b/common/chat.cpp
+index 39761f1..02d6f2e 100644
+--- a/common/chat.cpp
++++ b/common/chat.cpp
+@@ -1242,9 +1242,17 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
+ 
+         // Tool call parser
+         if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+-            auto arg_close  = p.tool_arg_close(p.literal("\n</parameter>\n"));
++            // QwenMax fix: tolerate missing newline before </parameter> (e.g. Qwen3.8-27B
++            // emits "北京</parameter>\n" while the strict "\n</parameter>\n" pattern below never
++            // matches, causing the whole remaining XML to be swallowed into arguments)
++            // [QwenMax C06 merge-strategy] upstream master rewrote this parser as a generic
++            // mechanism (</param> + CDATA, no newline requirement) and deleted this
++            // function; strix-halo-vulkan still uses the old parser. Keep until the
++            // fork syncs official master, then re-check and delete if covered.
++            auto arg_close  = p.tool_arg_close(p.choice({p.literal("\n</parameter>\n"), p.literal("</parameter>\n")}));
+             auto arg_string = p.rule("xml-arg-string",
+-                p.ac(p.tool_arg_string_value(p.until("\n</parameter>\n")) + arg_close, "\n</parameter>\n"));
++                p.ac(p.tool_arg_string_value(p.until_one_of({"\n</parameter>\n", "</parameter>\n"})) + arg_close,
++                     std::vector<std::string>{"\n</parameter>\n", "</parameter>\n"}));
+ 
+             auto tool_choice = p.choice();
+             foreach_function(inputs.tools, [&](const json & tool) {
+@@ -1296,6 +1304,27 @@ static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_
+             auto calls      = inputs.parallel_tool_calls ? tool_call_first + p.zero_or_more(tool_call) : tool_call_first;
+             auto tool_calls = p.trigger_rule("tool-call-root", p.repeat(calls, min_calls, 1));
+ 
++            // QwenMax fix: when tool_choice is REQUIRED, the model must emit a tool call
++            // instead of being allowed to produce an unbounded natural-language preamble
++            // (the upstream `content(until_one_of)` rule lets the model freely write prose
++            // up to the first <tool_call>, which general-purpose models such as Qwen3.8-27B
++            // exploit to fabricate answers and never call the tool).
++            // [QwenMax C06 merge-strategy] same as the </parameter> fix above: re-check
++            // after the fork syncs official master's generic tool parser.
++            if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
++                // keep matching the empty <think> block that templates emit when
++                // enable_thinking=false, otherwise grammar prefill rejects it
++                auto required_think = p.eps();
++                if (supports_reasoning && extract_reasoning) {
++                    required_think = p.optional("<think>" + p.space() +
++                                                p.reasoning(p.until_one_of({ "</think>", "<tool_call>" })) +
++                                                (p.literal("</think>") | p.peek(p.literal("<tool_call>"))));
++                } else if (supports_reasoning) {
++                    required_think = p.optional("<think>" + p.space() + p.literal("</think>") + p.space());
++                }
++                return generation_prompt + (required_think << tool_calls);
++            }
++
+             return generation_prompt +
+                    (reasoning << p.content(p.until_one_of(tool_call_starts)) << tool_calls);
+         }
+diff --git a/common/common.h b/common/common.h
+index d8a1689..6cac0b6 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -613,6 +613,11 @@ struct common_params {
+     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
++    // [QwenMax C01 merge-strategy] SSD prompt-cache tier params (local extension,
++    // no upstream equivalent); keep with ssd-prompt-cache.cpp.
++    int32_t cache_ssd_mib       = 0;     // SSD prompt cache limit in MiB, 0 - disable (default), -1 - no limit
++    int32_t cache_ssd_ttl_hours = 0;     // SSD prompt cache entry TTL in hours, 0 - disable (default)
++    std::string cache_ssd_path  = "";    // SSD prompt cache directory (default: "prompt-cache-ssd")
+ 
+     std::string hostname      = "127.0.0.1";
+     std::string public_path   = "";                                                                         // NOLINT
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 280bd9e..20178de 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -23,6 +23,9 @@ add_library(${TARGET} STATIC
+     server-mcp.h
+     server-schema.cpp
+     server-schema.h
++    # [QwenMax C01] SSD prompt-cache tier - local extension file (do not merge upstream)
++    ssd-prompt-cache.cpp
++    ssd-prompt-cache.h
+ )
+ 
+ if (BUILD_SHARED_LIBS)
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 7ed4865..19f1791 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -529,7 +529,12 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
+ }
+ 
+ const llama_tokens & server_tokens::get_tokens() const {
+-    GGML_ASSERT(!has_mtmd);
++    // QwenMax: has_mtmd is a model-level capability flag once a mmproj is loaded -
++    // assert on actual media presence instead
++    // [QwenMax C03 merge-strategy] upstream still asserts `!has_mtmd`; keep local.
++    // Small, self-contained -> candidate for a minimal upstream PR (needs the SSD
++    // dependency stripped first). Re-check on every rebase.
++    GGML_ASSERT(map_idx_to_media.empty());
+     return tokens;
+ }
+ 
+@@ -612,7 +617,10 @@ llama_tokens server_tokens::get_text_tokens() const {
+ }
+ 
+ void server_tokens::set_token(llama_pos pos, llama_token id) {
+-    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
++    // [QwenMax C03 merge-strategy] same as get_tokens: upstream asserts !has_mtmd;
++    // assert on actual media presence instead. Keep local; candidate for the same
++    // minimal upstream PR as get_tokens.
++    GGML_ASSERT(map_idx_to_media.empty()); // only allow this if no media chunks present
+     tokens[pos] = id;
+ }
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 1bef40a..884a675 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6,6 +6,7 @@
+ #include "server-queue.h"
+ #include "server-schema.h"
+ #include "server-stream.h"
++#include "ssd-prompt-cache.h"
+ 
+ #include "build-info.h"
+ #include "common.h"
+@@ -37,8 +38,74 @@
+ 
+ using json = nlohmann::ordered_json;
+ 
++// QwenMax diagnostic: log fatal SEH exceptions (access violation etc.) with the
++// [QwenMax C09 merge-strategy] Windows-generic VEH logger; candidate for a small
++// upstream PR (needs to be made generic / config-gated first). Keep local for now.
++// faulting address and a raw stack trace. We run without a debugger and WER takes
++// the process silently, so this is the only way to localize crashes in the field.
++#if defined(_WIN32)
++static LONG WINAPI qwenmax_crash_log(EXCEPTION_POINTERS * ep) {
++    const DWORD code = ep->ExceptionRecord->ExceptionCode;
++    if (code == 0xC0000005 || code == 0xC00000FD || code == 0xC0000409 || code == 0x80000003) {
++        void * addr = ep->ExceptionRecord->ExceptionAddress;
++        uintptr_t info0 = ep->ExceptionRecord->ExceptionInformation[0];
++        uintptr_t info1 = ep->ExceptionRecord->ExceptionInformation[1];
++
++        HMODULE mod = nullptr;
++        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
++                                (LPCWSTR) addr, &mod)) {
++            mod = nullptr;
++        }
++        char modname[MAX_PATH] = "?";
++        if (mod) {
++            GetModuleFileNameA(mod, modname, MAX_PATH);
++        }
++
++        void * frames[32] = {};
++        USHORT n_frames = CaptureStackBackTrace(0, 32, frames, nullptr);
++
++        char buf[2048];
++        int off = snprintf(buf, sizeof(buf),
++                "QWENMAX CRASH: code=0x%08lX addr=%p RVA=+0x%llX module=%s base=%p AV-%s @%p thread=%lu\n",
++                code, addr, mod ? (unsigned long long) ((uintptr_t) addr - (uintptr_t) mod) : 0ull,
++                modname, (void *) (uintptr_t) mod,
++                info0 == 0 ? "READ" : (info0 == 1 ? "WRITE" : "EXEC"), (void *) info1,
++                GetCurrentThreadId());
++        if (mod) {
++            for (USHORT i = 0; i < n_frames && off > 0 && off < (int) sizeof(buf) - 48; i++) {
++                const bool in_mod = (uintptr_t) frames[i] >= (uintptr_t) mod &&
++                                    (uintptr_t) frames[i] < (uintptr_t) mod + 0x40000000ull;
++                off += snprintf(buf + off, sizeof(buf) - off, "  [%02u] %p%s",
++                                i, frames[i], in_mod ? "" : "");
++                if (in_mod) {
++                    off += snprintf(buf + off, sizeof(buf) - off, " RVA=+0x%llX",
++                                    (unsigned long long) ((uintptr_t) frames[i] - (uintptr_t) mod));
++                }
++                off += snprintf(buf + off, sizeof(buf) - off, "\n");
++            }
++        }
++        fputs(buf, stderr);
++        fflush(stderr);
++        OutputDebugStringA(buf);
++    }
++    return EXCEPTION_CONTINUE_SEARCH;
++}
++
++static bool qwenmax_veh_installed = []() {
++    AddVectoredExceptionHandler(1, qwenmax_crash_log);
++    return true;
++}();
++#endif
++
+ constexpr int HTTP_POLLING_SECONDS = 1;
+ 
++// QwenMax: generation-segment rolling checkpoints (see the decode-loop comment).
++// [QwenMax C02 merge-strategy] compare against upstream --ctx-checkpoints /
++// --checkpoint-min-step on every rebase, drop the overlap, keep the rolling
++// generation-segment part (no upstream equivalent).
++constexpr int64_t QWENMAX_GEN_CKPT_STEP = 256; // snapshot every N decoded tokens
++constexpr size_t  QWENMAX_GEN_CKPT_KEEP = 2;   // generation checkpoints kept per slot
++
+ static common_speculative_output_limits server_output_limits(const common_params & params) {
+     if (params.embedding ||
+             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
+@@ -224,9 +291,14 @@ struct server_slot {
+     int64_t t_last_used = -1;
+ 
+     // generation props
+-    int32_t n_ctx   = 0;  // context size per slot
+-    int32_t n_keep  = 0;
+-    int32_t i_batch = -1;
++    int32_t n_ctx       = 0;  // context size per slot
++    int32_t n_keep      = 0;
++    int32_t n_decoded   = 0;
++    // QwenMax: n_decoded value when the last generation-segment checkpoint was
++    // taken. MTP accepts 2-3 tokens per decode step, so n_decoded skips multiples
++    // of the checkpoint step - a modulo test never fires. Track the distance instead.
++    int32_t n_decoded_ckpt_last = 0;
++    int32_t i_batch     = -1;
+ 
+     // effective generation limit for the current task, -1 means unlimited
+     int32_t n_predict_max = -1;
+@@ -279,8 +351,11 @@ struct server_slot {
+         return true;
+     }
+ 
+-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
+-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
++    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens, bool empty_base = false) {
++        // [QwenMax C01 merge-strategy] empty_base: on empty/replaced slots any cache
++        // entry may win (no LCP needed). Local extension of upstream server_prompt_cache
++        // interface - keep, re-check the hook on rebase.
++        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, empty_base);
+         if (!res) {
+             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+         }
+@@ -820,6 +895,10 @@ public:
+         }
+     }
+ 
++    // QwenMax: cache 统计 / 主动驱逐（供 /cache/stats 与 /cache/evict 端点使用）
++    json cache_stats_json() const;
++    json evict_ram_to_ssd(size_t target_mib);
++
+ private:
+     // note: accessing these fields outside of this class is not thread-safe
+     // use server_context methods instead
+@@ -860,6 +939,13 @@ private:
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
++    // QwenMax: prompt cache statistics (written on the inference thread, read by /cache/stats)
++    uint64_t n_heal_reqs  = 0;   // cache-aware retokenize 成功治愈的请求数
++    uint64_t n_heal_tokens = 0;  // 治愈后减少的 token 数累计
++
++    // note: declared after prompt_cache so it is destroyed first - prompt_cache holds a raw pointer to it
++    std::unique_ptr<server_prompt_cache_ssd> prompt_cache_ssd;
++
+     server_metrics metrics;
+ 
+     // queued prompt stats - llama_decode() is async, so the timing is only valid after a sync
+@@ -882,6 +968,19 @@ private:
+     int64_t t_last_load_progress_ms = 0;
+ 
+     void destroy() {
++        // persist slot prompts and all RAM cache states before tearing down the contexts
++        if (prompt_cache) {
++            for (auto & slot : slots) {
++                if (!slot.is_processing() && slot.prompt.n_tokens() > 0) {
++                    SLT_INF(slot, "%s", "saving slot prompt to the cache before teardown\n");
++
++                    slot.prompt_save(*prompt_cache);
++                }
++            }
++
++            prompt_cache->flush_to_ssd();
++        }
++
+         spec.reset();
+         spec_init.reset();
+ 
+@@ -1258,6 +1357,9 @@ private:
+ 
+             slot.mctx                   = mctx;
+             slot.prompt.tokens.has_mtmd = mctx != nullptr;
++            // note: has_mtmd here is a MODEL-level capability flag (the image-decode path asserts
++            // it when pushing media chunks). Prompt-cache/SSD decision points must NOT rely on it:
++            // they use find_next_media_chunk() to test for actual media in the token stream.
+ 
+             SLT_TRC(slot, "new slot, n_ctx = %d\n", slot.n_ctx);
+ 
+@@ -1310,8 +1412,63 @@ private:
+             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+ 
+             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++
++            if (params_base.cache_ssd_mib != 0) {
++                // fingerprint: everything that determines the state-data layout
++                std::string fp_desc;
++                {
++                    char desc[128];
++                    llama_model_desc(model_tgt, desc, sizeof(desc));
++                    fp_desc += desc;
++
++                    fp_desc += "|n_layer="       + std::to_string(llama_model_n_layer(model_tgt));
++                    fp_desc += "|n_layer_nextn=" + std::to_string(llama_model_n_layer_nextn(model_tgt));
++                    fp_desc += "|n_embd="        + std::to_string(llama_model_n_embd(model_tgt));
++                    fp_desc += "|n_head="        + std::to_string(llama_model_n_head(model_tgt));
++                    fp_desc += "|model="         + params_base.model.path;
++
++                    std::error_code ec;
++                    if (std::filesystem::exists(params_base.model.path, ec)) {
++                        fp_desc += "|size=" + std::to_string(std::filesystem::file_size(params_base.model.path, ec));
++                    }
++
++                    fp_desc += "|build=" + std::to_string(llama_build_number());
++
++                    // KV cache types determine the state-data layout - a state saved with
++                    // different k/v quantization is incompatible and must not be loaded.
++                    fp_desc += "|ckv=" + std::to_string((int32_t) params_base.cache_type_k);
++                    fp_desc += "|vkv=" + std::to_string((int32_t) params_base.cache_type_v);
++                }
++
++                const auto path_ssd = params_base.cache_ssd_path.empty() ? "prompt-cache-ssd" : params_base.cache_ssd_path;
++
++                // [QwenMax C01 merge-strategy] SSD tier (ssd-prompt-cache.h/.cpp local
++                // extension file); class lives outside upstream files - only this hook +
++                // save/load/evict/flush hooks touch upstream server code.
++                prompt_cache_ssd = std::make_unique<server_prompt_cache_ssd>(
++                        path_ssd, server_prompt_cache_ssd::make_fingerprint(fp_desc), params_base.cache_ssd_mib,
++                        params_base.cache_ssd_ttl_hours);
++
++                if (prompt_cache_ssd->init()) {
++                    prompt_cache->ssd = prompt_cache_ssd.get();
++
++                    if (params_base.cache_ssd_mib < 0) {
++                        SRV_INF("ssd prompt cache enabled: no size limit, dir: %s\n", path_ssd.c_str());
++                    } else {
++                        SRV_INF("ssd prompt cache enabled: limit %d MiB, dir: %s\n", params_base.cache_ssd_mib, path_ssd.c_str());
++                    }
++                } else {
++                    SRV_WRN("%s", "ssd prompt cache could not be initialized - continuing without it\n");
++
++                    prompt_cache_ssd.reset();
++                }
++            }
+         } else {
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
++
++            if (params_base.cache_ssd_mib != 0) {
++                SRV_WRN("%s", "ssd cache requires the ram cache to be enabled (`--cache-ram N`) - ignoring --cache-ssd\n");
++            }
+         }
+         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+ 
+@@ -1486,6 +1643,149 @@ private:
+         return nullptr;
+     }
+ 
++    // QwenMax: cache-aware re-tokenization (token healing against cached token streams).
++    // [QwenMax C02 merge-strategy] no upstream equivalent - keep. Re-check the
++    // detokenize/detokenize_with_cache helpers it uses on rebase.
++    //
++    // BPE divergence: greedy generation emits tokens step-by-step ("充满" + "了"),
++    // while common_tokenize() of the same text prefers multi-char merges ("充满了").
++    // When the next turn re-renders the conversation, the strict token-level LCP
++    // against the cached state (slot or RAM prompt cache) breaks at the first such
++    // boundary (~100 tokens into the previous reply) - the similarity slot lookup
++    // misses and the whole history gets re-prefilled. This is the "cache dies after
++    // every reply" effect.
++    //
++    // Fix: before slot selection, compare the *text* of the incoming prompt with the
++    // text of cached token streams. For the longest common text prefix, adopt the
++    // cached token sequence verbatim (the exact tokens that produced the KV/SSM
++    // state) and tokenize only the remaining text. The result is verified to
++    // detokenize back to the identical prompt text, so semantics never drift -
++    // only token boundaries are healed to keep the cache alive.
++    void retokenize_with_cache(server_task & task) {
++        // QwenMax: actual-media check instead of has_mtmd (which is unreliable once mmproj loaded)
++        if (!task.params.cache_prompt || task.tokens.find_next_media_chunk(0).first != nullptr || task.tokens.size() == 0) {
++            return;
++        }
++
++        const std::string text_new = task.tokens.detokenize(ctx_tgt, true);
++
++        // candidate token streams: live slots, then RAM cache states (newest first),
++        // then SSD entries (QwenMax: after a cold start the slots and RAM cache
++        // are empty - the SSD token streams are the only candidates that can heal
++        // the prompt against the persisted KV state; without them the SSD LCP match
++        // below fails on the re-rendered token stream and the whole context is
++        // re-prefilled)
++        std::vector<const server_tokens *> candidates;
++        std::vector<server_tokens> ssd_candidates;
++
++        for (const auto & slot : slots) {
++            if (slot.prompt.n_tokens() > 0) {
++                candidates.push_back(&slot.prompt.tokens);
++            }
++        }
++        if (prompt_cache) {
++            for (auto it = prompt_cache->states.rbegin(); it != prompt_cache->states.rend() && candidates.size() < 64; ++it) {
++                candidates.push_back(&it->prompt.tokens);
++            }
++        }
++        // SSD entries participate only on a cold start (slots and RAM cache
++        // empty). Once a live slot holds any state it is a strictly better
++        // healing target - its token stream IS the KV state. Letting an SSD
++        // entry win the text-LCP here aligns the prompt to a foreign stream
++        // and drops the token LCP against the live slot (cache re-prefill).
++        if (prompt_cache && prompt_cache->ssd && candidates.empty()) {
++            // reserve up front: emplace_back on a vector reallocates and would
++            // invalidate the &back() pointers already pushed into candidates
++            ssd_candidates.reserve(std::min<size_t>(prompt_cache->ssd->n_entries(), 64));
++            for (const auto & e : prompt_cache->ssd->entries_view()) {
++                if (candidates.size() >= 64 || e.tokens.empty()) {
++                    continue;
++                }
++                ssd_candidates.emplace_back(e.tokens, /* has_mtmd */ false);
++                candidates.push_back(&ssd_candidates.back());
++            }
++        }
++
++        const server_tokens * best = nullptr;
++        size_t best_lcp = 0;
++
++        for (const auto * cand : candidates) {
++            if (cand->size() == 0) {
++                continue;
++            }
++
++            const std::string text_cand = cand->detokenize(ctx_tgt, true);
++
++            size_t lcp = 0;
++            while (lcp < text_cand.size() && lcp < text_new.size() && text_cand[lcp] == text_new[lcp]) {
++                lcp++;
++            }
++            // back off to a UTF-8 character boundary
++            while (lcp > 0 && (uint8_t) text_new[lcp] >= 0x80 && (uint8_t) text_new[lcp] < 0xC0) {
++                lcp--;
++            }
++
++            if (lcp > best_lcp) {
++                best_lcp = lcp;
++                best = cand;
++            }
++        }
++
++        // too little in common for the healing to matter
++        if (best == nullptr || best_lcp < 256) {
++            return;
++        }
++
++        // find max k so that the first k cached tokens detokenize to <= best_lcp bytes
++        const llama_tokens & toks = best->get_text_tokens();
++
++        size_t prefix_bytes = 0;
++        size_t k = 0;
++        for (; k < toks.size(); ++k) {
++            const auto piece = common_token_to_piece(ctx_tgt, toks[k], true);
++            if (prefix_bytes + piece.size() > best_lcp) {
++                break;
++            }
++            prefix_bytes += piece.size();
++        }
++
++        if (k == 0) {
++            return;
++        }
++
++        llama_tokens merged(toks.begin(), toks.begin() + k);
++        if (prefix_bytes < text_new.size()) {
++            const auto tail = common_tokenize(vocab, text_new.substr(prefix_bytes), /*add_special*/ false, /*parse_special*/ true);
++            merged.insert(merged.end(), tail.begin(), tail.end());
++        }
++
++        // nothing to heal
++        if (merged == task.tokens.get_text_tokens()) {
++            return;
++        }
++
++        // safety: healed tokens must decode back to the exact same prompt text
++        server_tokens healed(merged, false);
++        if (healed.detokenize(ctx_tgt, true) != text_new) {
++            SRV_WRN("cache-aware retokenize: healed tokens decode to different text, keeping original tokens (task %d)\n", task.id);
++            return;
++        }
++
++        const size_t n_before = task.tokens.size();
++
++        task.tokens = std::move(healed);
++
++        // recompute message spans over the healed tokens
++        task.params.message_spans = task.tokens.find_message_spans(task.params.message_delimiters);
++
++        // QwenMax: 统计 heal 次数与节省的 token 数（/cache/stats 暴露）
++        ++n_heal_reqs;
++        n_heal_tokens += n_before > task.tokens.size() ? n_before - task.tokens.size() : 0;
++
++        SRV_INF("cache-aware retokenize: task %d healed %d -> %d tokens (common text prefix %zu bytes with a %d-token stream)\n",
++                task.id, (int) n_before, (int) task.tokens.size(), best_lcp, (int) toks.size());
++    }
++
+     server_slot * get_available_slot(const server_task & task) {
+         server_slot * ret = nullptr;
+ 
+@@ -1588,7 +1888,10 @@ private:
+ 
+                 ret->prompt_save(*prompt_cache);
+ 
+-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
++                // QwenMax: we just decided to replace this slot's prompt, and its
++                // current state is saved above - let a genuine cache entry win over
++                // the stale in-slot prompt regardless of its f_keep baseline.
++                if (!ret->prompt_load(*prompt_cache, task.tokens, /* empty_base */ true)) {
+                     ret->prompt_clear();
+                 }
+ 
+@@ -2244,6 +2547,20 @@ private:
+     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+         const int id_task = slot.task->id;
+ 
++        // QwenMax: if the newest checkpoint of this task already covers the exact same
++        // memory state (e.g. the checkpoint we just restored from), skip the snapshot.
++        // On hybrid models each snapshot is a ~150 MiB recurrent-state readback.
++        if (!slot.prompt.checkpoints.empty()) {
++            const auto & newest = slot.prompt.checkpoints.back();
++            if (newest.id_task == id_task &&
++                newest.pos_max == pos_max &&
++                newest.n_tokens == (int64_t) (slot.prompt.n_tokens() - n_tokens_cur)) {
++                SLT_TRC(slot, "skipping identical context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
++                        newest.pos_min, newest.pos_max, newest.n_tokens);
++                return;
++            }
++        }
++
+         // evict checkpoints within min-step of a previous checkpoint, unless they were
+         // created by the current task
+         int64_t last = -1;
+@@ -2279,10 +2596,19 @@ private:
+         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+ 
++        // QwenMax: per-phase timing to locate checkpoint overhead
++        const auto t_ck_0 = std::chrono::steady_clock::now();
+         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        const auto t_ck_1 = std::chrono::steady_clock::now();
+         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
++        const auto t_ck_2 = std::chrono::steady_clock::now();
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
++        const auto t_ck_3 = std::chrono::steady_clock::now();
++        SLT_TRC(slot, "checkpoint save timing: tgt = %.1f ms, dft = %.1f ms, spec = %.1f ms\n",
++                1e-6f * std::chrono::duration_cast<std::chrono::nanoseconds>(t_ck_1 - t_ck_0).count(),
++                1e-6f * std::chrono::duration_cast<std::chrono::nanoseconds>(t_ck_2 - t_ck_1).count(),
++                1e-6f * std::chrono::duration_cast<std::chrono::nanoseconds>(t_ck_3 - t_ck_2).count());
+ 
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+@@ -2290,6 +2616,96 @@ private:
+                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+     }
+ 
++    // QwenMax: rolling checkpoints over the generated segment.
++    //
++    // Upstream creates context checkpoints only while processing the prompt
++    // (user-message boundaries + prompt tail). After a hybrid/recurrent model
++    // decodes, pos_min rises to the sequence head, so every next turn rolls
++    // the state back to the newest checkpoint - which sits at the *prompt
++    // tail*, before the generation - and re-prefills the entire previous
++    // reply. A long answer costs the user tens of seconds on the next turn.
++    //
++    // Snapshot every QWENMAX_GEN_CKPT_STEP decoded tokens, keeping only
++    // the newest QWENMAX_GEN_CKPT_KEEP of them (~150 MiB readback per
++    // snapshot on hybrid models; ~0.4% decode throughput at step 256).
++    //
++    // Must be called from BOTH decode paths: the plain-sampling branch and the
++    // speculative (MTP) accept branch - with draft-mtp enabled the plain branch
++    // returns early and never runs.
++    void maybe_gen_checkpoint(server_slot & slot) {
++        // [QwenMax C02 merge-strategy] rolling generation-segment checkpoints -
++        // no upstream equivalent (upstream --ctx-checkpoints only covers prompt
++        // segments); keep. Called from both decode paths, re-check call sites.
++        // QwenMax: actual-media check (has_mtmd is unreliable once mmproj loaded)
++        if (params_base.n_ctx_checkpoints <= 0 || slot.prompt.tokens.find_next_media_chunk(0).first != nullptr) {
++            return;
++        }
++
++        // threshold crossing (not modulo): MTP accepts multiple tokens per
++        // verify step, so n_decoded skips over modulo positions
++        if (slot.n_decoded - slot.n_decoded_ckpt_last < QWENMAX_GEN_CKPT_STEP) {
++            return;
++        }
++
++        slot.n_decoded_ckpt_last = slot.n_decoded;
++
++        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
++        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++
++        if (pos_min < 0) {
++            return;
++        }
++
++        // trim generation-segment checkpoints (those covering tokens past
++        // this task's prompt input) down to KEEP - 1, oldest first
++        const int64_t n_prompt_task = slot.task->n_tokens();
++
++        size_t n_gen = 0;
++        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
++            if (it->n_tokens > n_prompt_task && ++n_gen >= QWENMAX_GEN_CKPT_KEEP) {
++                SLT_TRC(slot, "erasing old generation checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
++                        it->pos_min, it->pos_max, it->n_tokens);
++
++                it = slot.prompt.checkpoints.erase(it);
++            } else {
++                ++it;
++            }
++        }
++
++        create_checkpoint(slot, 0, pos_min, pos_max);
++    }
++
++    // QwenMax: snapshot at generation end.
++    //
++    // A rolling generation checkpoint is taken mid-reply (every
++    // QWENMAX_GEN_CKPT_STEP tokens), so its pos_max is always at or beyond
++    // the pos_next of the next turn's request - the restore filter
++    // (pos_max > pos_next => invalid) rejects it and the next turn rolls back
++    // to the previous prompt-tail checkpoint, re-prefilling the whole reply.
++    // This is the "cache dies after every long reply" effect.
++    //
++    // The final snapshot covers exactly the prompt + generated tokens, i.e.
++    // the state the next re-rendered request starts from (once cache-aware
++    // re-tokenization aligns the prompt). It must be taken on every stop path.
++    void maybe_final_checkpoint(server_slot & slot) {
++        // [QwenMax C02 merge-strategy] final checkpoint at generation end (rolls
++        // the segment checkpoint forward to the exact stop position); keep with
++        // maybe_gen_checkpoint.
++        // QwenMax: actual-media check (has_mtmd is unreliable once mmproj loaded)
++        if (params_base.n_ctx_checkpoints <= 0 || slot.prompt.tokens.find_next_media_chunk(0).first != nullptr) {
++            return;
++        }
++
++        const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
++        const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
++
++        if (pos_min < 0) {
++            return;
++        }
++
++        create_checkpoint(slot, 0, pos_min, pos_max);
++    }
++
+     // returns false to decline the task, it is offered again after the decode is done
+     bool process_single_task(server_task && task, bool is_yielding) {
+         // while yielding, an encode / decode is running and only accessing metrics is safe
+@@ -2314,6 +2730,10 @@ private:
+ 
+                     const int id_task = task.id;
+ 
++                    // QwenMax: heal token boundaries against cached streams so the
++                    // similarity lookup sees the previous reply as a common prefix
++                    retokenize_with_cache(task);
++
+                     server_slot * slot = get_available_slot(task);
+ 
+                     //
+@@ -2862,7 +3282,8 @@ private:
+                 // add generated tokens to cache
+                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
+                 {
+-                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
++                    // QwenMax: has_mtmd is a model-level flag once mmproj loaded - test actual media
++                    GGML_ASSERT(slot.prompt.tokens.find_next_media_chunk(0).first == nullptr);
+ 
+                     llama_tokens new_tokens = slot.prompt.tokens.get_tokens(); // copy
+                     for (size_t i = n_keep + n_discard; i < new_tokens.size(); i++) {
+@@ -3139,7 +3560,8 @@ private:
+ 
+                                 const bool can_cache_reuse =
+                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+-                                    !slot.prompt.tokens.has_mtmd;
++                                    // QwenMax: actual-media check (has_mtmd is model-level once mmproj loaded)
++                                    slot.prompt.tokens.find_next_media_chunk(0).first == nullptr;
+ 
+                                 if (!can_cache_reuse && n_cache_reuse > 0) {
+                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
+@@ -3147,7 +3569,7 @@ private:
+ 
+                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
+                                 if (can_cache_reuse && n_cache_reuse > 0) {
+-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
++                                    GGML_ASSERT(slot.prompt.tokens.find_next_media_chunk(0).first == nullptr);
+ 
+                                     size_t head_c = n_past; // cache
+                                     size_t head_p = n_past; // current prompt
+@@ -3282,6 +3704,12 @@ private:
+                                         // restore the draft's speculative state
+                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+ 
++                                        // QwenMax: tag the restored checkpoint as owned by the current task,
++                                        // so that create_checkpoint() does not evict it via the min-step rule and
++                                        // then re-snapshot the exact same state (each snapshot costs a full
++                                        // ~150 MiB GDN state readback on hybrid models).
++                                        it->id_task = slot.task->id;
++
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+@@ -3383,6 +3811,12 @@ private:
+                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
+                             n_swa > 0);
+ 
++                    // QwenMax: has_mtmd is a model-level capability flag - restore it before
++                    // pushing media chunks. A prompt-cache load (RAM or SSD) replaces
++                    // slot.prompt.tokens with a server_tokens constructed with has_mtmd=false,
++                    // which would trip GGML_ASSERT(has_mtmd) in push_back() below.
++                    slot.prompt.tokens.has_mtmd = slot.mctx != nullptr;
++
+                     bool has_mtmd = false;
+ 
+                     // check if we should process the mtmd chunk
+@@ -3507,8 +3941,10 @@ private:
+                         // extract the logits only for the last token
+                         batch.set_output(batch.size() - 1, true);
+ 
++                        slot.n_decoded = 0;
++                        slot.n_decoded_ckpt_last = 0;
+                         slot.stats.n_gen = 0;
+-                        slot.i_batch     = batch.size() - 1;
++                        slot.i_batch   = batch.size() - 1;
+ 
+                         slot.init_sampler();
+                     } else {
+@@ -3795,12 +4231,16 @@ private:
+             if (!process_token(result, slot)) {
+                 // release slot because of stop condition
+                 slot.print_timings();
++                maybe_final_checkpoint(slot);
+                 send_final_response(slot);
+                 slot.release();
+ 
+                 return;
+             }
+ 
++            // QwenMax: rolling generation-segment checkpoint (see maybe_gen_checkpoint)
++            maybe_gen_checkpoint(slot);
++
+             slot.print_timings_tg();
+         });
+ 
+@@ -3923,6 +4363,7 @@ private:
+ 
+                 if (!process_token(result, slot)) {
+                     slot.print_timings();
++                    maybe_final_checkpoint(slot);
+                     send_final_response(slot);
+                     slot.release();
+ 
+@@ -3930,6 +4371,11 @@ private:
+                 }
+             }
+ 
++            // QwenMax: rolling generation-segment checkpoint (see maybe_gen_checkpoint).
++            // This is the decode path actually taken with draft-mtp enabled - the plain
++            // sampling branch above returns early when speculating.
++            maybe_gen_checkpoint(slot);
++
+             slot.print_timings_tg();
+ 
+             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+@@ -4230,6 +4676,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
+                     data);
+ 
+             task.params.message_spans = task.tokens.find_message_spans(delimiters);
++            // QwenMax: keep the delimiters so message_spans can be recomputed if
++            // cache-aware re-tokenization rewrites task.tokens in the main loop.
++            task.params.message_delimiters = delimiters;
+ 
+             task.id_slot = json_value(data, "id_slot", -1);
+             sse_ping_interval = task.params.sse_ping_interval;
+@@ -4437,6 +4886,31 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
+     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
+ }
+ 
++// QwenMax: prompt cache 统计快照（RAM/SSD 条目、字节、heal 计数）
++// [QwenMax C01 merge-strategy] local endpoint data (GET /cache/stats); keep.
++json server_context_impl::cache_stats_json() const {
++    return {
++        {"ram_entries",   prompt_cache      ? (json) prompt_cache->states.size() : 0},
++        {"ram_bytes",     prompt_cache      ? (json) prompt_cache->size()         : 0},
++        {"ram_tokens",    prompt_cache      ? (json) prompt_cache->n_tokens()    : 0},
++        {"ssd_entries",   prompt_cache_ssd  ? (json) prompt_cache_ssd->n_entries() : 0},
++        {"ssd_bytes",     prompt_cache_ssd  ? (json) prompt_cache_ssd->size()      : 0},
++        {"ssd_tokens",    prompt_cache_ssd  ? (json) prompt_cache_ssd->n_tokens()  : 0},
++        {"heal_requests", n_heal_reqs},
++        {"heal_tokens",   n_heal_tokens},
++    };
++}
++
++// QwenMax: 低内存主动驱逐——把 RAM 池最老条目落盘至目标大小，返回驱逐后的池状态
++// [QwenMax C01 merge-strategy] local endpoint data (POST /cache/evict); keep.
++json server_context_impl::evict_ram_to_ssd(size_t target_mib) {
++    if (prompt_cache) {
++        prompt_cache->evict_to_ssd(target_mib);
++        return {{"ram_entries", prompt_cache->states.size()}, {"ram_bytes", prompt_cache->size()}};
++    }
++    return {{"ram_entries", 0}, {"ram_bytes", 0}};
++}
++
+ server_routes::server_routes(const common_params & params, server_context & ctx_server)
+         : params(params),
+           ctx_server(*ctx_server.impl),
+@@ -4543,6 +5017,31 @@ void server_routes::init_routes() {
+         return res;
+     };
+ 
++    this->get_cache_stats = [this](const server_http_req & req) {
++        auto res = create_response();
++        res->ok(ctx_server.cache_stats_json());
++        return res;
++    };
++
++    this->post_cache_evict = [this](const server_http_req & req) {
++        auto res = create_response();
++
++        const std::string tp = req.get_param("ram_target_mib");
++        if (tp.empty()) {
++            res->error(format_error_response("missing required query parameter 'ram_target_mib'", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++
++        const long long target_mib = std::atoll(tp.c_str());
++        if (target_mib <= 0) {
++            res->error(format_error_response("'ram_target_mib' must be > 0", ERROR_TYPE_INVALID_REQUEST));
++            return res;
++        }
++
++        res->ok(ctx_server.evict_ram_to_ssd((size_t) target_mib));
++        return res;
++    };
++
+     this->post_slots = [this](const server_http_req & req) {
+         auto res = create_response();
+         if (params.slot_save_path.empty()) {
+diff --git a/tools/server/server-context.h b/tools/server/server-context.h
+index f9ab113..7abf2bc 100644
+--- a/tools/server/server-context.h
++++ b/tools/server/server-context.h
+@@ -131,6 +131,8 @@ struct server_routes {
+     server_http_context::handler_t get_metrics;
+     server_http_context::handler_t get_slots;
+     server_http_context::handler_t post_slots;
++    server_http_context::handler_t get_cache_stats; // QwenMax: prompt cache 统计（RAM/SSD/heal）[C01 keep]
++    server_http_context::handler_t post_cache_evict; // QwenMax: 低内存时主动把 RAM 池最老条目落盘（?ram_target_mib=N）[C01 keep]
+     server_http_context::handler_t get_props;
+     server_http_context::handler_t post_props;
+     server_http_context::handler_t post_infill;
+@@ -174,7 +176,7 @@ private:
+     std::unique_ptr<const server_context_meta> meta;
+ 
+     const common_params & params;
+-    const server_context_impl & ctx_server;
++    server_context_impl & ctx_server; // QwenMax: 非 const —— /cache/evict 需要修改 RAM 池
+ 
+     server_queue & queue_tasks;
+     server_response & queue_results;
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 64afbc5..2ae46dc 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -9,6 +9,12 @@
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "server-common.h"
++#include "ssd-prompt-cache.h"
++
++#include <sstream>
++#include <filesystem>
++#include <fstream>
++#include <chrono>
+ 
+ #include <sstream>
+ 
+@@ -1716,6 +1722,14 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         }
+     }
+ 
++    if (ssd && ssd->contains(prompt.tokens)) {
++        // [QwenMax C01 merge-strategy] SSD tier hook (alloc path); the SSD class
++        // itself lives in ssd-prompt-cache.h/.cpp - only these hooks sit in upstream
++        // files. Re-check against upstream prompt-cache changes on rebase.
++        SRV_TRC("%s", " - prompt is already in the SSD cache, skipping\n");
++        return nullptr;
++    }
++
+     // calculate checkpoints size to see if it will fit with the prompt
+     size_t checkpoints_size = 0;
+     for (const auto & ckpt : prompt.checkpoints) {
+@@ -1744,12 +1758,22 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+         }
+     }
+ 
++    // same for the SSD entries
++    if (ssd) {
++        ssd->remove_contained(prompt.tokens);
++    }
++
+     if (limit_size > 0) {
+         // make room before allocating the new vectors to avoid breaching the limit
+         while (!states.empty() && size() + state_size_new > limit_size) {
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
++            // evict to the SSD layer instead of dropping, when available
++            if (ssd) {
++                ssd->save_state(states.front());
++            }
++
+             states.pop_front();
+         }
+     }
+@@ -1787,11 +1811,12 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     return &states.back();
+ }
+ 
+-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
++bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool empty_base) {
++    const int lcp_best = empty_base ? 0 : prompt.tokens.get_common_prefix(tokens_new);
+ 
+-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+-    float f_sim_best  = float(lcp_best) / tokens_new.size();
++    // empty slot (or empty_base): any cache entry wins
++    float f_keep_best = (!empty_base && prompt.tokens.size() > 0) ? float(lcp_best) / prompt.tokens.size() : -1.0f;
++    float f_sim_best  = empty_base ? -1.0f : float(lcp_best) / tokens_new.size();
+ 
+     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+ 
+@@ -1819,6 +1844,13 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         }
+     }
+ 
++    // try the SSD layer - it only fires when it strictly beats the current best (RAM) candidate
++    // [QwenMax C01 merge-strategy] SSD load hook (load path); keep, re-check the
++    // LCP/f_keep/f_sim thresholds against upstream prompt-cache evolution.
++    if (ssd && ssd->load_state(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot, f_keep_best, f_sim_best)) {
++        return true;
++    }
++
+     if (it_best != states.end()) {
+         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+ 
+@@ -1869,6 +1901,11 @@ void server_prompt_cache::update() {
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
++            // evict to the SSD layer instead of dropping, when available
++            if (ssd) {
++                ssd->save_state(states.front());
++            }
++
+             states.pop_front();
+         }
+     }
+@@ -1884,6 +1921,11 @@ void server_prompt_cache::update() {
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
++            // evict to the SSD layer instead of dropping, when available
++            if (ssd) {
++                ssd->save_state(states.front());
++            }
++
+             states.pop_front();
+         }
+     }
+@@ -1895,4 +1937,57 @@ void server_prompt_cache::update() {
+         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
+                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+     }
++
++    if (ssd) {
++        SRV_TRC(" - ssd cache state: %zu entries, %.3f MiB\n", ssd->n_entries(), ssd->size() / (1024.0 * 1024.0));
++    }
++}
++
++void server_prompt_cache::evict_to_ssd(size_t target_mib) {
++    // [QwenMax C01 merge-strategy] local API (low-memory eviction, called by
++    // POST /cache/evict): persist LRU entries to SSD without dropping. Keep.
++    const size_t target_bytes = 1024ull * 1024ull * target_mib;
++
++    size_t n_evicted = 0;
++    size_t n_bytes   = 0;
++
++    while (!states.empty() && size() > target_bytes) {
++        SRV_INF(" - low-memory evict: removing oldest entry (size = %.3f MiB, %d tokens)\n",
++                states.front().size() / (1024.0 * 1024.0), (int) states.front().prompt.n_tokens());
++
++        if (ssd) {
++            ssd->save_state(states.front());   // persist, never drop
++        }
++
++        n_bytes += states.front().size();
++        states.pop_front();
++        n_evicted++;
++    }
++
++    if (n_evicted > 0) {
++        SRV_INF("evicted %zu RAM cache states (%.3f MiB) to the ssd cache, remaining: %zu states, %.3f MiB\n",
++                n_evicted, n_bytes / (1024.0 * 1024.0), states.size(), size() / (1024.0 * 1024.0));
++    }
++}
++
++void server_prompt_cache::flush_to_ssd() {
++    // [QwenMax C01 merge-strategy] teardown hook: persist all RAM states to SSD on
++    // graceful exit so a restart hits the SSD tier cold. Keep with the SSD layer.
++    if (!ssd || states.empty()) {
++        return;
++    }
++
++    SRV_INF("flushing %zu prompt cache states (%.3f MiB) to the ssd cache\n",
++            states.size(), size() / (1024.0 * 1024.0));
++
++    size_t n_saved = 0;
++
++    for (const auto & state : states) {
++        if (ssd->save_state(state)) {
++            n_saved++;
++        }
++    }
++
++    SRV_INF("flushed %zu/%zu states to the ssd cache (%zu entries, %.3f MiB total)\n",
++            n_saved, states.size(), ssd->n_entries(), ssd->size() / (1024.0 * 1024.0));
+ }
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index b6da4d4..c6e324e 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -94,6 +94,11 @@ struct task_params {
+     // message spans for checkpointing
+     common_chat_msg_spans message_spans;
+ 
++    // QwenMax: the request's parsed message delimiters, kept so that message_spans
++    // can be recomputed after cache-aware re-tokenization rewrites task.tokens.
++    // [QwenMax C02 merge-strategy] keep with retokenize_with_cache (server-context.cpp).
++    common_chat_msg_delimiters message_delimiters;
++
+     // Embeddings
+     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+ 
+@@ -604,6 +609,10 @@ struct server_prompt_cache_state {
+     }
+ };
+ 
++// SSD persistence layer for the prompt cache - defined in ssd-prompt-cache.h
++// (standalone QwenMax extension so this upstream file only carries a hook pointer)
++struct server_prompt_cache_ssd;
++
+ struct server_prompt_cache {
+     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+@@ -612,6 +621,9 @@ struct server_prompt_cache {
+ 
+     std::list<server_prompt_cache_state> states;
+ 
++    // optional SSD persistence layer (owned by server_context_impl)
++    server_prompt_cache_ssd * ssd = nullptr;
++
+     // in bytes, 0 = no limit
+     size_t limit_size = 0;
+ 
+@@ -624,9 +636,21 @@ struct server_prompt_cache {
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
+-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
++    // QwenMax: empty_base = treat the slot's current prompt as absent when
++    // computing the f_keep/f_sim baseline. Used when the caller is about to
++    // replace the slot's prompt anyway (LRU takeover / f_keep < 0.5): a stale
++    // foreign prompt left by an auxiliary request must not out-vote a genuine
++    // cache entry that covers more of the incoming prompt.
++    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, bool empty_base = false);
+ 
+     void update();
++
++    // QwenMax: actively evict oldest RAM states to the SSD layer until size <= target_mib.
++    // Used on system low-memory pressure (POST /cache/evict). States are persisted, not dropped.
++    void evict_to_ssd(size_t target_mib);
++
++    // write all RAM states to the SSD layer (if attached), used on shutdown/sleep
++    void flush_to_ssd();
+ };
+ 
+ // used exclusively by router mode
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index 6d1aa43..03ef7c8 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -13,6 +13,7 @@
+ #include "log.h"
+ 
+ #include <atomic>
++#include <chrono>
+ #include <clocale>
+ #include <exception>
+ #include <signal.h>
+@@ -48,6 +49,27 @@ void llama_server_terminate() {
+     }
+ }
+ 
++// QwenMax: HTTP-triggered graceful shutdown (POST /max/shutdown).
++//
++// On Windows there is no reliable way to deliver CTRL_C_EVENT to a child
++// process from a supervisor (AttachConsole across processes is brittle), so
++// the supervisor (max.py) stops us over HTTP instead. We answer first,
++// then a short-delay detached thread enters the exact same shutdown path as
++// Ctrl+C: ctx_server.terminate() -> start_loop() returns -> clean_up ->
++// ~server_context_impl -> destroy(), which flushes idle slot KV/SSM states
++// to the SSD cache pool before exit.
++static server_http_res_ptr handle_max_shutdown(const server_http_req &) {
++    std::thread([]{
++        std::this_thread::sleep_for(std::chrono::milliseconds(200));
++        llama_server_terminate();
++    }).detach();
++
++    auto res = std::make_unique<server_http_res>();
++    res->status = 200;
++    res->data = safe_json_to_str({{"stopping", true}});
++    return res;
++}
++
+ 
+ // wrapper function that handles exceptions and logs errors
+ // this is to make sure handler_t never throws exceptions; instead, it returns an error response
+@@ -272,6 +294,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
+     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+ 
++    // QwenMax: prompt cache statistics (RAM/SSD entries, bytes, heal counters)
++    // [QwenMax C01 merge-strategy] local endpoints (SSD tier monitoring); keep.
++    ctx_http.get ("/cache/stats",              ex_wrapper(routes.get_cache_stats));
++    ctx_http.post("/cache/evict",              ex_wrapper(routes.post_cache_evict));
++
++    // QwenMax: graceful shutdown endpoint (see handle_max_shutdown above)
++    // [QwenMax C10 merge-strategy] PRIVATE - do NOT upstream: an unauthenticated
++    // HTTP shutdown endpoint is a public attack surface (remote kill switch).
++    // Only safe on loopback.
++    ctx_http.post("/max/shutdown",          ex_wrapper(handle_max_shutdown));
++
+     // resumable streaming: a child binds the local session factories, the router binds
+     // proxies that resolve the owning child, see server-stream.h
+     server_http_context::handler_t stream_get_h;
+diff --git a/tools/server/ssd-prompt-cache.cpp b/tools/server/ssd-prompt-cache.cpp
+new file mode 100644
+index 0000000..bdbcfcc
+--- /dev/null
++++ b/tools/server/ssd-prompt-cache.cpp
+@@ -0,0 +1,632 @@
++#include "ssd-prompt-cache.h"
++
++#include "server-common.h"   // SRV_* logging macros
++#include "llama.h"
++
++#include <algorithm>
++#include <chrono>
++#include <filesystem>
++#include <fstream>
++#include <vector>
++
++//
++// server_prompt_cache_ssd
++//
++
++namespace {
++
++constexpr uint32_t SSD_CACHE_MAGIC_INDEX = 0x53534449; // "SSDI"
++constexpr uint32_t SSD_CACHE_MAGIC_STATE = 0x53534443; // "SSDC"
++constexpr uint32_t SSD_CACHE_VERSION     = 2;
++
++static_assert(sizeof(llama_pos) == sizeof(int32_t), "unexpected llama_pos size");
++
++// FNV-1a 64-bit
++uint64_t ssd_hash_str(const std::string & s) {
++    uint64_t h = 14695981039346656037ull;
++    for (const char c : s) {
++        h ^= (uint8_t) c;
++        h *= 1099511628211ull;
++    }
++    return h;
++}
++
++int64_t ssd_time_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(
++            std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
++// plain-token LCP with the same semantics as server_tokens::get_common_prefix (text-only)
++size_t ssd_common_prefix(const llama_tokens & a, const server_tokens & b) {
++    // QwenMax: has_mtmd is a model-level flag once a mmproj is loaded - test for actual media instead
++    GGML_ASSERT(b.find_next_media_chunk(0).first == nullptr);
++
++    const auto & bt = b.get_tokens();
++
++    const size_t max_idx = std::min(a.size(), bt.size());
++
++    for (size_t i = 0; i < max_idx; ++i) {
++        if (a[i] != bt[i]) {
++            return i;
++        }
++    }
++
++    return max_idx;
++}
++
++// POD + blob writer over an ofstream
++struct ssd_file_writer {
++    std::ofstream f;
++
++    explicit ssd_file_writer(const std::string & path) : f(path, std::ios::binary) {}
++
++    bool good() const { return f.good(); }
++
++    template <typename T>
++    void write(const T & v) {
++        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
++        f.write(reinterpret_cast<const char *>(&v), sizeof(v));
++    }
++
++    void write_blob(const void * p, size_t n) {
++        write<uint64_t>(n);
++        if (n > 0) {
++            f.write(reinterpret_cast<const char *>(p), n);
++        }
++    }
++
++    void write_blob(const std::vector<uint8_t> & v) {
++        write_blob(v.data(), v.size());
++    }
++};
++
++// POD + blob reader over an ifstream
++struct ssd_file_reader {
++    std::ifstream f;
++
++    explicit ssd_file_reader(const std::string & path) : f(path, std::ios::binary) {}
++
++    bool good() const { return f.good(); }
++
++    template <typename T>
++    T read() {
++        static_assert(std::is_trivially_copyable<T>::value, "T must be trivially copyable");
++        T v;
++        f.read(reinterpret_cast<char *>(&v), sizeof(v));
++        if (!f.good()) {
++            throw std::runtime_error("unexpected end of ssd cache file");
++        }
++        return v;
++    }
++
++    std::vector<uint8_t> read_blob() {
++        const uint64_t n = read<uint64_t>();
++        if (n > (1ull << 40)) {
++            throw std::runtime_error("implausible blob size in ssd cache file");
++        }
++        std::vector<uint8_t> v(n);
++        if (n > 0) {
++            f.read(reinterpret_cast<char *>(v.data()), n);
++            if (!f.good()) {
++                throw std::runtime_error("unexpected end of ssd cache file");
++            }
++        }
++        return v;
++    }
++};
++
++} // namespace
++
++server_prompt_cache_ssd::server_prompt_cache_ssd(std::string path, uint64_t fingerprint, int32_t limit_size_mib, int64_t ttl_hours) {
++    namespace fs = std::filesystem;
++
++    this->fingerprint = fingerprint;
++    this->limit_size  = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
++    this->ttl_ms      = 3600ull*1000ull*std::max<int64_t>(0, ttl_hours);
++    this->path_dir    = fs::path(path).string();
++    this->path_index  = (fs::path(path_dir) / "index.bin").string();
++}
++
++server_prompt_cache_ssd::~server_prompt_cache_ssd() = default;
++
++uint64_t server_prompt_cache_ssd::make_fingerprint(const std::string & s) {
++    return ssd_hash_str(s);
++}
++
++bool server_prompt_cache_ssd::init() {
++    namespace fs = std::filesystem;
++
++    std::error_code ec;
++
++    if (!fs::exists(path_dir, ec)) {
++        fs::create_directories(path_dir, ec);
++        if (ec) {
++            SRV_ERR("ssd cache: failed to create directory '%s': %s\n", path_dir.c_str(), ec.message().c_str());
++            return false;
++        }
++        return true;
++    }
++
++    try {
++        if (fs::exists(path_index)) {
++            ssd_file_reader r(path_index);
++
++            const uint32_t magic = r.read<uint32_t>();
++            const uint32_t ver   = r.read<uint32_t>();
++
++            if (magic == SSD_CACHE_MAGIC_INDEX && ver == SSD_CACHE_VERSION && r.read<uint64_t>() == fingerprint) {
++                next_id = r.read<uint64_t>();
++
++                const uint32_t n = r.read<uint32_t>();
++                for (uint32_t i = 0; i < n; ++i) {
++                    entry e;
++
++                    e.id         = r.read<uint64_t>();
++                    e.t_last_use = r.read<int64_t>();
++                    e.size_total = r.read<uint64_t>();
++
++                    const uint32_t n_tok = r.read<uint32_t>();
++                    e.tokens.resize(n_tok);
++                    if (n_tok > 0) {
++                        r.f.read(reinterpret_cast<char *>(e.tokens.data()), n_tok * sizeof(llama_token));
++                        if (!r.f.good()) {
++                            throw std::runtime_error("unexpected end of ssd cache index");
++                        }
++                    }
++
++                    // drop entries whose state file went missing
++                    const auto path_state = (fs::path(path_dir) / ("state_" + std::to_string(e.id) + ".bin")).string();
++                    if (!fs::exists(path_state)) {
++                        SRV_WRN("ssd cache: state file for entry %llu is missing, dropping\n", (unsigned long long) e.id);
++                        continue;
++                    }
++
++                    next_id = std::max<size_t>(next_id, e.id + 1);
++
++                    entries.push_back(std::move(e));
++                }
++            } else {
++                SRV_WRN("%s", "ssd cache: index fingerprint or format mismatch, wiping directory\n");
++
++                fs::remove_all(path_dir, ec);
++                fs::create_directories(path_dir, ec);
++
++                entries.clear();
++                next_id = 1;
++            }
++        }
++    } catch (const std::exception & e) {
++        SRV_WRN("ssd cache: failed to read index (%s), wiping directory\n", e.what());
++
++        fs::remove_all(path_dir, ec);
++        fs::create_directories(path_dir, ec);
++
++        entries.clear();
++        next_id = 1;
++    }
++
++    cleanup_expired();  // drop entries idle beyond the TTL (if configured) before reporting
++
++    SRV_INF("ssd cache: %zu entries, %.3f MiB (limit: %.3f MiB), dir: %s\n",
++            entries.size(), size() / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0), path_dir.c_str());
++
++    return true;
++}
++
++bool server_prompt_cache_ssd::save_index() const {
++    namespace fs = std::filesystem;
++
++    // QwenMax: atomic write (tmp + rename), same as save_state.
++    // A crash mid-write must not corrupt index.bin - init() wipes the whole
++    // cache directory when the index fails to load, so a torn index would
++    // take down every otherwise-intact state file with it.
++    const auto path_tmp = path_index + ".tmp";
++
++    try {
++        {
++            ssd_file_writer w(path_tmp);
++
++            if (!w.good()) {
++                return false;
++            }
++
++            w.write<uint32_t>(SSD_CACHE_MAGIC_INDEX);
++            w.write<uint32_t>(SSD_CACHE_VERSION);
++            w.write<uint64_t>(fingerprint);
++            w.write<uint64_t>(next_id);
++            w.write<uint32_t>((uint32_t) entries.size());
++
++            for (const auto & e : entries) {
++                w.write<uint64_t>(e.id);
++                w.write<int64_t>(e.t_last_use);
++                w.write<uint64_t>(e.size_total);
++                w.write<uint32_t>((uint32_t) e.tokens.size());
++                if (!e.tokens.empty()) {
++                    w.f.write(reinterpret_cast<const char *>(e.tokens.data()), e.tokens.size() * sizeof(llama_token));
++                }
++            }
++
++            if (!w.good()) {
++                std::error_code ec;
++                fs::remove(path_tmp, ec);
++                return false;
++            }
++        }
++
++        std::error_code ec;
++        fs::rename(path_tmp, path_index, ec);
++        if (ec) {
++            // windows: rename onto an existing file fails - remove and retry
++            fs::remove(path_index, ec);
++            fs::rename(path_tmp, path_index, ec);
++            if (ec) {
++                SRV_WRN("ssd cache: failed to finalize index '%s': %s\n", path_index.c_str(), ec.message().c_str());
++                fs::remove(path_tmp, ec);
++                return false;
++            }
++        }
++
++        return true;
++    } catch (const std::exception & e) {
++        SRV_WRN("ssd cache: failed to write index: %s\n", e.what());
++        std::error_code ec;
++        fs::remove(path_tmp, ec);
++        return false;
++    }
++}
++
++void server_prompt_cache_ssd::remove_entry(std::list<entry>::iterator it) {
++    namespace fs = std::filesystem;
++
++    std::error_code ec;
++
++    const auto path_state = (fs::path(path_dir) / ("state_" + std::to_string(it->id) + ".bin")).string();
++    fs::remove(path_state, ec);
++
++    entries.erase(it);
++}
++
++void server_prompt_cache_ssd::cleanup_expired() {
++    if (ttl_ms <= 0 || entries.empty()) {
++        return;
++    }
++
++    const int64_t now = ssd_time_ms();
++
++    bool changed = false;
++
++    auto it = entries.begin();
++    while (it != entries.end()) {
++        if (now - it->t_last_use > ttl_ms) {
++            SRV_INF("ssd cache: ttl cleanup, removing entry %llu (last used %lld s ago)\n",
++                    (unsigned long long) it->id, (long long) (now - it->t_last_use) / 1000);
++
++            const auto todel = it++;
++            remove_entry(todel);
++            changed = true;
++        } else {
++            ++it;
++        }
++    }
++
++    if (changed) {
++        save_index();
++    }
++}
++
++void server_prompt_cache_ssd::make_room(size_t size_new) {
++    if (limit_size == 0) {
++        return;
++    }
++
++    while (!entries.empty() && size() + size_new > limit_size) {
++        SRV_WRN("ssd cache: making room, removing oldest entry (size = %.3f MiB)\n",
++                entries.front().size_total / (1024.0 * 1024.0));
++
++        remove_entry(entries.begin());
++    }
++}
++
++bool server_prompt_cache_ssd::save_state(const server_prompt_cache_state & state) {
++    namespace fs = std::filesystem;
++
++    cleanup_expired();  // lazy TTL cleanup before touching the index
++
++    // QwenMax: reject only states that actually contain media chunks. has_mtmd alone is not a
++    // reliable signal (it used to be forced true by mmproj presence) and would drop pure-text
++    // states, silently disabling the SSD cache once a mmproj is loaded.
++    if (state.prompt.tokens.find_next_media_chunk(0).first != nullptr) {
++        // v1: text-only prompts
++        return false;
++    }
++
++    const auto & toks = state.prompt.tokens.get_tokens();
++
++    if (toks.empty()) {
++        return false;
++    }
++
++    const size_t size_total = state.size();
++
++    if (limit_size > 0 && size_total > limit_size) {
++        SRV_WRN("ssd cache: state size %.3f MiB exceeds limit %.3f MiB, skipping\n",
++                size_total / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
++        return false;
++    }
++
++    make_room(size_total);
++
++    const auto t_start = std::chrono::steady_clock::now();
++
++    try {
++        const auto id = next_id++;
++
++        const auto path_state = (fs::path(path_dir) / ("state_" + std::to_string(id) + ".bin")).string();
++        const auto path_tmp  = path_state + ".tmp";
++
++        {
++            ssd_file_writer w(path_tmp);
++
++            if (!w.good()) {
++                SRV_WRN("ssd cache: cannot open '%s' for writing\n", path_tmp.c_str());
++                return false;
++            }
++
++            w.write<uint32_t>(SSD_CACHE_MAGIC_STATE);
++            w.write<uint32_t>(SSD_CACHE_VERSION);
++            w.write<uint64_t>(fingerprint);
++
++            // v2: raw token vector (text-only prompts; media-bearing states are skipped upstream)
++            w.write_blob(toks.data(), toks.size() * sizeof(llama_token));
++
++            w.write<uint32_t>((uint32_t) state.prompt.checkpoints.size());
++            for (const auto & ckpt : state.prompt.checkpoints) {
++                w.write<int64_t>(ckpt.n_tokens);
++                w.write<int32_t>(ckpt.id_task);
++                w.write<int32_t>(ckpt.pos_min);
++                w.write<int32_t>(ckpt.pos_max);
++
++                w.write_blob(ckpt.data_tgt);
++                w.write_blob(ckpt.data_dft);
++                w.write_blob(ckpt.data_spec);
++            }
++
++            w.write_blob(state.data.main);
++            w.write_blob(state.data.drft);
++        }
++
++        std::error_code ec;
++        fs::rename(path_tmp, path_state, ec);
++        if (ec) {
++            // windows: rename onto an existing file fails - remove and retry
++            fs::remove(path_state, ec);
++            fs::rename(path_tmp, path_state, ec);
++            if (ec) {
++                SRV_WRN("ssd cache: failed to finalize '%s': %s\n", path_state.c_str(), ec.message().c_str());
++                fs::remove(path_tmp, ec);
++                return false;
++            }
++        }
++
++        entry e;
++        e.id         = id;
++        e.t_last_use = ssd_time_ms();
++        e.size_total = size_total;
++        e.tokens     = toks;
++
++        entries.push_back(std::move(e));
++
++        save_index();
++
++        const auto t_dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
++
++        SRV_INF("ssd cache: saved %zu tokens, %.3f MiB in %lld ms (%.1f MiB/s), entries: %zu, total: %.3f MiB\n",
++                toks.size(), size_total / (1024.0 * 1024.0), (long long) t_dur,
++                t_dur > 0 ? (size_total / (1024.0 * 1024.0)) / (t_dur / 1000.0) : 0.0f,
++                entries.size(), size() / (1024.0 * 1024.0));
++
++        return true;
++    } catch (const std::exception & e) {
++        SRV_WRN("ssd cache: failed to save state: %s\n", e.what());
++        return false;
++    }
++}
++
++bool server_prompt_cache_ssd::load_state(server_prompt & prompt, const server_tokens & tokens_new,
++        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
++        float f_keep_min, float f_sim_min) {
++    namespace fs = std::filesystem;
++
++    cleanup_expired();  // lazy TTL cleanup before matching
++
++    // QwenMax: same actual-media check as save_state (has_mtmd is unreliable once mmproj loaded)
++    if (tokens_new.find_next_media_chunk(0).first != nullptr) {
++        // v1: text-only prompts
++        return false;
++    }
++
++    auto it_best = entries.end();
++
++    for (auto it = entries.begin(); it != entries.end(); ++it) {
++        const size_t lcp_cur = ssd_common_prefix(it->tokens, tokens_new);
++
++        const float f_keep_cur = float(lcp_cur) / it->tokens.size();
++        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
++
++        // don't trash large prompts
++        if (f_keep_cur < 0.25f) {
++            continue;
++        }
++
++        if (f_keep_min < f_keep_cur && f_sim_min < f_sim_cur) {
++            f_keep_min = f_keep_cur;
++            f_sim_min  = f_sim_cur;
++
++            it_best = it;
++        }
++    }
++
++    if (it_best == entries.end()) {
++        return false;
++    }
++
++    SRV_INF("ssd cache: candidate entry %llu with f_keep = %.3f, f_sim = %.3f\n",
++            (unsigned long long) it_best->id, f_keep_min, f_sim_min);
++
++    const auto t_start = std::chrono::steady_clock::now();
++
++    bool ok = false;
++
++    try {
++        const auto path_state = (fs::path(path_dir) / ("state_" + std::to_string(it_best->id) + ".bin")).string();
++
++        ssd_file_reader r(path_state);
++
++        if (!r.good()) {
++            throw std::runtime_error("cannot open state file");
++        }
++
++        if (r.read<uint32_t>() != SSD_CACHE_MAGIC_STATE || r.read<uint32_t>() != SSD_CACHE_VERSION || r.read<uint64_t>() != fingerprint) {
++            throw std::runtime_error("state file format or fingerprint mismatch");
++        }
++
++        const auto tokens_raw = r.read_blob();
++
++        // v2: raw token vector, padded to llama_token granularity
++        llama_tokens packed(reinterpret_cast<const llama_token *>(tokens_raw.data()),
++                            reinterpret_cast<const llama_token *>(tokens_raw.data()) + tokens_raw.size() / sizeof(llama_token));
++
++        server_prompt prompt_new;
++
++        prompt_new.tokens = server_tokens(packed, /* has_mtmd */ false);
++
++        const uint32_t n_ckpt = r.read<uint32_t>();
++        for (uint32_t i = 0; i < n_ckpt; ++i) {
++            common_prompt_checkpoint ckpt;
++
++            ckpt.n_tokens = r.read<int64_t>();
++            ckpt.id_task  = r.read<int32_t>();
++            ckpt.pos_min  = r.read<int32_t>();
++            ckpt.pos_max  = r.read<int32_t>();
++
++            ckpt.data_tgt  = r.read_blob();
++            ckpt.data_dft  = r.read_blob();
++            ckpt.data_spec = r.read_blob();
++
++            prompt_new.checkpoints.push_back(std::move(ckpt));
++        }
++
++        auto data_main = r.read_blob();
++        auto data_drft = r.read_blob();
++
++        {
++            const size_t sz = data_main.size();
++            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data_main.data(), sz, id_slot, 0);
++            if (n != sz) {
++                throw std::runtime_error("failed to restore tgt state with size " + std::to_string(sz) + " (got " + std::to_string(n) + ")");
++            }
++        }
++
++        if (!data_drft.empty()) {
++            GGML_ASSERT(ctx_dft);
++
++            const size_t sz = data_drft.size();
++            const size_t n = llama_state_seq_set_data_ext(ctx_dft, data_drft.data(), sz, id_slot, 0);
++            if (n != sz) {
++                throw std::runtime_error("failed to restore dft state with size " + std::to_string(sz) + " (got " + std::to_string(n) + ")");
++            }
++        }
++
++        prompt = std::move(prompt_new);
++
++        ok = true;
++    } catch (const std::exception & e) {
++        SRV_WRN("ssd cache: failed to load state: %s\n", e.what());
++    }
++
++    // one-shot restore: the slot now owns the state
++    const size_t size_restored = it_best->size_total;
++
++    if (ok) {
++        remove_entry(it_best);
++        save_index();
++    } else {
++        // keep the entry so a future request can retry loading it
++        // (e.g. a transient read failure should not destroy cached state)
++        SRV_WRN("ssd cache: keeping entry %llu after failed load\n",
++                (unsigned long long) it_best->id);
++    }
++
++    if (ok) {
++        const auto t_dur = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_start).count();
++
++        SRV_INF("ssd cache: restored %zu tokens (%.3f MiB) in %lld ms (%.1f MiB/s), entries left: %zu\n",
++                prompt.tokens.size(), size_restored / (1024.0 * 1024.0), (long long) t_dur,
++                t_dur > 0 ? (size_restored / (1024.0 * 1024.0)) / (t_dur / 1000.0) : 0.0f,
++                entries.size());
++    }
++
++    return ok;
++}
++
++void server_prompt_cache_ssd::remove_contained(const server_tokens & tokens_new) {
++    // QwenMax: actual-media check (has_mtmd is unreliable once mmproj loaded)
++    if (tokens_new.find_next_media_chunk(0).first != nullptr) {
++        // v1: text-only prompts
++        return;
++    }
++
++    bool removed = false;
++
++    for (auto it = entries.begin(); it != entries.end();) {
++        if (ssd_common_prefix(it->tokens, tokens_new) == it->tokens.size()) {
++            SRV_TRC("ssd cache: removing obsolete entry %llu with length %zu\n", (unsigned long long) it->id, it->tokens.size());
++
++            const auto todel = it++;   // advance before erase (remove_entry invalidates it)
++            remove_entry(todel);
++            removed = true;
++        } else {
++            ++it;
++        }
++    }
++
++    if (removed) {
++        save_index();
++    }
++}
++
++bool server_prompt_cache_ssd::contains(const server_tokens & tokens_new) const {
++    // QwenMax: actual-media check (has_mtmd is unreliable once mmproj loaded)
++    if (tokens_new.find_next_media_chunk(0).first != nullptr) {
++        // v1: text-only prompts
++        return false;
++    }
++
++    for (const auto & e : entries) {
++        if (ssd_common_prefix(e.tokens, tokens_new) == tokens_new.size()) {
++            return true;
++        }
++    }
++
++    return false;
++}
++
++size_t server_prompt_cache_ssd::size() const {
++    size_t res = 0;
++
++    for (const auto & e : entries) {
++        res += e.size_total;
++    }
++
++    return res;
++}
++
++size_t server_prompt_cache_ssd::n_tokens() const {
++    size_t res = 0;
++
++    for (const auto & e : entries) {
++        res += e.tokens.size();
++    }
++
++    return res;
++}
+diff --git a/tools/server/ssd-prompt-cache.h b/tools/server/ssd-prompt-cache.h
+new file mode 100644
+index 0000000..0898ad9
+--- /dev/null
++++ b/tools/server/ssd-prompt-cache.h
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include "server-task.h"
++
++#include "llama.h"
++
++#include <list>
++#include <string>
++
++// SSD persistence layer for the prompt cache (QwenMax extension)
++// qwenmax extension - do not merge upstream: standalone file so upstream server
++// files only carry a handful of hook calls (see [QwenMax C01] marks).
++//
++// Layout:
++//   <path>/index.bin       - entry metadata + tokens for LCP matching without reading state files
++//   <path>/state_<id>.bin  - serialized server_prompt_cache_state (tokens, checkpoints, tgt/dft data)
++//
++// Entries are keyed by a fingerprint (model identity + build number). A fingerprint mismatch
++// wipes the whole directory on startup.
++//
++// This is a standalone extension file so that the upstream server files only
++// carry a handful of hook calls (see server_prompt_cache::ssd and the
++// ssd->... calls in server-task.cpp) - rebasing against upstream stays cheap.
++struct server_prompt_cache_ssd {
++    struct entry {
++        uint64_t    id = 0;         // used for the state file name
++        int64_t     t_last_use = 0; // unix ms, for LRU eviction
++        size_t      size_total = 0; // main + drft + checkpoints, in bytes
++
++        // plain token ids for LCP matching (same semantics as server_tokens::get_common_prefix)
++        llama_tokens tokens;
++    };
++
++    server_prompt_cache_ssd(std::string path, uint64_t fingerprint, int32_t limit_size_mib, int64_t ttl_hours);
++
++    ~server_prompt_cache_ssd();
++
++    // FNV-1a 64-bit hash used for the fingerprint
++    static uint64_t make_fingerprint(const std::string & s);
++
++    // load the index from disk, wiping the directory on fingerprint/format mismatch
++    bool init();
++
++    // remove entries whose last use is older than the configured TTL (hours).
++    // Lazy: called at init() and at the top of save_state()/load_state().
++    void cleanup_expired();
++
++    // persist a state; returns false on I/O or format errors (state is dropped, not fatal)
++    bool save_state(const server_prompt_cache_state & state);
++
++    // find the best entry for tokens_new using the same f_keep/f_sim policy as the RAM cache,
++    // but only accept it if it beats the given thresholds (the RAM cache's current best).
++    // On success, loads the state into the contexts and removes the entry (one-shot restore).
++    bool load_state(server_prompt & prompt, const server_tokens & tokens_new,
++                    llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
++                    float f_keep_min, float f_sim_min);
++
++    // remove entries whose tokens are fully contained in the given prompt (obsolete prefixes)
++    void remove_contained(const server_tokens & tokens_new);
++
++    // true if some entry fully contains the prompt (i.e. no need to store it again)
++    bool contains(const server_tokens & tokens_new) const;
++
++    size_t size() const;
++
++    size_t n_tokens() const;
++
++    size_t n_entries() const { return entries.size(); }
++
++    // QwenMax: expose the entry token streams so that cache-aware
++    // re-tokenization can heal prompts against SSD state (the only candidates
++    // available right after a cold start, when slots and RAM cache are empty)
++    const std::list<entry> & entries_view() const { return entries; }
++
++private:
++    bool save_index() const;
++    void make_room(size_t size_new);
++    void remove_entry(std::list<entry>::iterator it);
++
++    std::string path_dir;
++    std::string path_index;
++
++    uint64_t fingerprint = 0;
++
++    // in bytes, 0 = no limit
++    size_t limit_size = 0;
++
++    // entry TTL in ms, 0 = disabled (see --cache-ssd-ttl-hours)
++    int64_t ttl_ms = 0;
++
++    size_t next_id = 1;
++
++    std::list<entry> entries;
++};

@@ -1,4 +1,4 @@
 [submodule "vendor/llama.cpp"]
 	path = vendor/llama.cpp
-	url = ../ai-qwen-max-llama.cpp.git
-	branch = qwenmax
+	url = ../Ryzen-UMA-Vulkan-llama.git
+	branch = ryzen-uma-vulkan

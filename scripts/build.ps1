@@ -1,11 +1,14 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
   AI-Qwen-Max 构建脚本
   目标：裁剪构建 llama-server —— 只为本机（Ryzen AI Max+ 395 / gfx1151）+ Vulkan + 原生指令。
   放弃通用化：关闭一切无关后端，只用 NMake Makefiles + Release + GGML_NATIVE。
 
   引擎源码位于 vendor/llama.cpp（git submodule，fork 自 Nathanw1014/llama.cpp 的
-  strix-halo-vulkan 分支，qwenmax 分支叠加本项目定制补丁）。
+  strix-halo-vulkan 分支）。引擎仓库 = 纯平台层（Ryzen/UMA/Vulkan 优化，分支
+  ryzen-uma-vulkan）；本项目的产品层定制（SSD 缓存 / 生成段 checkpoint /
+  retokenize 治愈 / qwen3_coder 容错 / SEH / shutdown 端点）以补丁形式在
+  构建前应用，补丁文件：patches/qwenmax-server-layer.patch。
 #>
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent   # 仓库根（本脚本在 scripts\ 下）
@@ -36,7 +39,7 @@ $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
 if (-not (Test-Path $vcvars)) { throw "未找到 vcvars64.bat：$vcvars" }
 Write-Host "[2/5] MSVC      : $vsPath"
 
-# ---- 3. 源码（git submodule，qwenmax 分支） ----
+# ---- 3. 源码（git submodule，ryzen-uma-vulkan 分支） ----
 if (-not (Test-Path (Join-Path $llamaDir 'CMakeLists.txt'))) {
     Write-Host "[3/5] 初始化 submodule ..."
     git -C $root submodule update --init --recursive
@@ -47,6 +50,23 @@ if (-not (Test-Path (Join-Path $llamaDir 'CMakeLists.txt'))) {
 }
 $pinnedCommit = git -C $llamaDir rev-parse HEAD
 Write-Host "[3/5] 源码     : $llamaDir  (commit: $pinnedCommit)"
+
+# ---- 3b. 应用产品层 patch（C01/C02/C03/C06/C09/C10，见 patches/） ----
+# 引擎仓库只含平台层；产品定制以补丁叠加。幂等：已应用则跳过。
+$patchPath = Join-Path $root 'patches\qwenmax-server-layer.patch'
+if (-not (Test-Path $patchPath)) {
+    throw "缺少产品层补丁：$patchPath"
+}
+git -C $llamaDir apply --check --reverse $patchPath 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "[3b] 产品层 patch：已应用，跳过"
+} else {
+    Write-Host "[3b] 应用产品层 patch ..."
+    git -C $llamaDir apply $patchPath
+    if ($LASTEXITCODE -ne 0) {
+        throw "产品层 patch 应用失败（引擎已升级？需用 scripts/refresh-patch.ps1 重新生成补丁）。"
+    }
+}
 
 # ---- 4. CMake 配置（裁剪：只留 Vulkan + server + 原生指令） ----
 $cmakeFlags = @(
