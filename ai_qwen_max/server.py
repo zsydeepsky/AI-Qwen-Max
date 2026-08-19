@@ -21,7 +21,11 @@ from fastapi.staticfiles import StaticFiles
 
 from .backend import Backend
 from .config import CTX_CHOICES, Config
+from .dsh import sync_dsh_input
 from .events import ApiEvents
+from .gguf import find_mmproj, model_media, resolve_model_path
+from .llm import (effort_chat_kwargs, effort_system_injection,
+                  template_supports_effort)
 from .store import SessionStore
 
 API_GATE_CAP = 2   # 并发推理闸：与 llama-server slot 预算匹配（2 路 API + 1 路内部）
@@ -194,6 +198,44 @@ def create_app(actx: AppCtx) -> FastAPI:
 
     # ================= /v1 反代 =================
 
+    def _models_body(raw: bytes) -> bytes:
+        """给 /v1/models 响应注入多模态 architecture（pi coding agent 兼容字段）。
+
+        llama-server 的 OpenAI 风格 data[] 不含 architecture，而 pi coding agent /
+        DeepSeek Harness 依赖 data[].architecture.input_modalities 判断多模态。
+        按模型是否带 mmproj（视觉塔）注入 "image"，其它字段原样保留。
+        """
+        try:
+            j = json.loads(raw)
+        except (ValueError, AttributeError):
+            return raw
+        mm = find_mmproj(actx.backend.model or "") if actx.backend.model else None
+        mods = ["text"] if not mm else ["text", "image"]
+        data = j.get("data")
+        if isinstance(data, list):
+            for m in data:
+                if isinstance(m, dict):
+                    m["architecture"] = {
+                        "input_modalities": list(mods),
+                        "output_modalities": ["text"],
+                    }
+        return json.dumps(j, ensure_ascii=False).encode("utf-8")
+
+    @app.api_route("/models", methods=["GET"])
+    async def proxy_models():
+        """Ollama 风格 /models：llama-server 此构建与 /v1/models 同构，透传并注入 architecture。"""
+        r = await actx.aclient.get("/v1/models", timeout=15)
+        body = _models_body(r.content) if r.status_code == 200 else r.content
+        return Response(content=body, status_code=r.status_code,
+                        media_type="application/json")
+
+    @app.api_route("/props", methods=["GET"])
+    async def proxy_props():
+        """llama-server /props 透传：含 modalities.vision 等模型能力信息，部分客户端依赖。"""
+        r = await actx.aclient.get("/props", timeout=15)
+        return Response(content=r.content, status_code=r.status_code,
+                        media_type=r.headers.get("content-type") or "application/json")
+
     @app.api_route("/v1/{path:path}", methods=["GET", "POST"])
     async def proxy_v1(path: str, request: Request):
         url = f"/v1/{path}"
@@ -202,11 +244,47 @@ def create_app(actx: AppCtx) -> FastAPI:
             body = await request.body()
         is_post = request.method == "POST"
         wants_stream = False
+        up_body = body                       # 转发用 body；默认原样
         if is_post and body:
             try:
-                wants_stream = bool(json.loads(body).get("stream"))
+                obj = json.loads(body)
             except (ValueError, AttributeError):
-                wants_stream = False
+                obj = None
+            if isinstance(obj, dict):
+                wants_stream = bool(obj.get("stream"))
+                # 流式 chat 默认 include_usage=false（server-task.h），usage 事件不发，
+                # timings 挂 finish_reason chunk 且 cache_n 在 MTP 下虚高。
+                # 反代层只在调用方未显式指定时补 include_usage=true，
+                # 拿规范 cached_tokens（永远 <= total）。
+                so = obj.get("stream_options")
+                if (path == "chat/completions" and obj.get("stream")
+                        and not (isinstance(so, dict) and "include_usage" in so)):
+                    obj.setdefault("stream_options", {})["include_usage"] = True
+                    up_body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+                # effort 降级：GGUF 模板不支持 reasoning_effort（如 qwen35moe）时，
+                # 该参数被模板静默忽略、档位失效。反代层按引擎全局档位（cfg）把
+                # effort 翻译为 enable_thinking + 头部 system 档位指令，并剔除无效参数。
+                # 调用方显式传了 enable_thinking 则完全尊重其选择。
+                tpl = getattr(actx.backend, "chat_template", None)
+                if path == "chat/completions" and not template_supports_effort(tpl):
+                    ctk = obj.get("chat_template_kwargs")
+                    explicit = isinstance(ctk, dict) and "enable_thinking" in ctk
+                    if not isinstance(ctk, dict):
+                        ctk = {}
+                        obj["chat_template_kwargs"] = ctk
+                    ctk.pop("reasoning_effort", None)
+                    if not explicit:
+                        effort = str(actx.cfg.get("reasoning_effort", "low"))
+                        ctk.update(effort_chat_kwargs(effort, tpl))
+                        hint = effort_system_injection(effort, tpl)
+                        msgs = obj.get("messages")
+                        if hint and isinstance(msgs, list) and msgs:
+                            first_role = (msgs[0].get("role")
+                                          if isinstance(msgs[0], dict) else None)
+                            if first_role not in ("system", "developer"):
+                                obj["messages"] = [{"role": "system",
+                                                    "content": hint}] + list(msgs)
+                    up_body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         conv_id = request.headers.get("X-Conversation-Id", "")
 
         req_id = uuid.uuid4().hex[:12]
@@ -227,17 +305,31 @@ def create_app(actx: AppCtx) -> FastAPI:
             gate_acquired = True
         try:
             if is_post:
-                upstream = actx.aclient.build_request(request.method, url, content=body, headers=headers)
+                upstream = actx.aclient.build_request(request.method, url,
+                                                      content=up_body, headers=headers)
             else:
                 upstream = actx.aclient.build_request(request.method, url, headers=headers)
             if wants_stream:
                 return await _stream_proxy(actx, upstream, rec, conv_id, t0)
             r = await actx.aclient.send(upstream)
+            cache_n = prompt_n = None
+            perf: dict | None = None
+            if path == "chat/completions" and r.status_code == 200:
+                try:
+                    j = r.json()
+                    cache_n, prompt_n = _cache_numbers(j)
+                    perf = _perf_from(t0, None, j.get("timings") or {})
+                except ValueError:
+                    pass
             actx.events.emit(actx.events.finish(rec, status=r.status_code,
-                                                dur_s=time.monotonic() - t0))
+                                                dur_s=time.monotonic() - t0,
+                                                cache_n=cache_n, prompt_n=prompt_n,
+                                                perf=perf))
             if conv_id and path == "chat/completions" and r.status_code == 200:
                 _persist_completion(actx, conv_id, body, r.content)
-            return Response(content=r.content, status_code=r.status_code,
+            content = (_models_body(r.content)
+                       if path == "models" and r.status_code == 200 else r.content)
+            return Response(content=content, status_code=r.status_code,
                             media_type=r.headers.get("content-type"))
         except httpx.HTTPError as e:
             actx.events.emit(actx.events.finish(rec, error=str(e), dur_s=time.monotonic() - t0))
@@ -257,19 +349,25 @@ def create_app(actx: AppCtx) -> FastAPI:
             text = ""
             last_push = 0.0
             buffer = b""
+            footer: dict = {}
+            first_at: float | None = None   # 首个 reasoning/content delta 时间（TTFT 基准）
 
             def _drain(buf: bytes) -> bytes:
                 """处理 buf 中所有完整行（以 \\n 结尾），返回不完整尾行。"""
-                nonlocal reasoning, text, last_push
+                nonlocal reasoning, text, last_push, footer, first_at
                 if b"\n" not in buf:
                     return buf
                 usable, _, remainder = buf.rpartition(b"\n")
                 for line in usable.decode("utf-8", "replace").split("\n"):
-                    kind, delta = _delta_from_sse_line(line)
+                    kind, delta, f = _delta_from_sse_line(line)
                     if kind == "reasoning":
                         reasoning += delta
                     elif kind == "content":
                         text += delta
+                    elif f:
+                        footer = f               # 缓存命中数据来自 footer
+                    if kind and first_at is None:
+                        first_at = time.monotonic()
                 now = time.monotonic()
                 if now - last_push > 0.15:   # 150ms 节流推送累计文本
                     actx.events.emit(actx.events.finish(rec, reasoning=reasoning, text=text))
@@ -289,14 +387,20 @@ def create_app(actx: AppCtx) -> FastAPI:
                 if buffer:
                     _drain(buffer + b"\n")
                 await resp.aclose()
+                cache_n, prompt_n = _cache_numbers(footer) if footer else (None, None)
+                timings = (footer or {}).get("timings") or {}
+                perf = _perf_from(t0, first_at, timings)
+                if perf:
+                    actx.last_perf = dict(perf)   # 供 /status 展示最近一轮精确 perf
                 actx.events.emit(actx.events.finish(
                     rec, status=resp.status_code, dur_s=time.monotonic() - t0,
-                    reasoning=reasoning, text=text))
-                actx.last_perf["dur_s"] = time.monotonic() - t0
+                    reasoning=reasoning, text=text,
+                    cache_n=cache_n, prompt_n=prompt_n, perf=perf))
                 if conv_id:
                     assistant: dict[str, Any] = {"role": "assistant", "content": text}
                     if reasoning:
                         assistant["reasoning_content"] = reasoning
+                    assistant.update(_assistant_meta(actx, perf, cache_n, prompt_n))
                     try:
                         req_body = json.loads(rec.get("body", "") or "{}")
                         _persist_messages(actx, conv_id,
@@ -317,6 +421,10 @@ def create_app(actx: AppCtx) -> FastAPI:
             assistant: dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
             if msg.get("reasoning_content"):
                 assistant["reasoning_content"] = msg["reasoning_content"]
+            cache_n, prompt_n = _cache_numbers(resp)
+            perf = _perf_from(0.0, None, resp.get("timings") or {})
+            perf.pop("dur_s", None)   # 非流式无端到端计时
+            assistant.update(_assistant_meta(actx, perf, cache_n, prompt_n))
             _persist_messages(actx, conv_id, req.get("messages") or [], assistant)
         except (ValueError, IndexError, KeyError):
             pass
@@ -335,11 +443,31 @@ def create_app(actx: AppCtx) -> FastAPI:
         loaded = actx.backend.healthy()
         return {"status": "ok" if loaded else "loading", "loaded": loaded}
 
+    @app.get("/api/capabilities")
+    async def capabilities():
+        """当前模型能接受的媒体（文本/图片/音频）。
+
+        OpenAI 规范没有能力发现字段，这里参考 Ollama /api/show 的
+        capabilities 风格（英文键），供 Web UI / 外部 agent 自动感知。
+        """
+        model = actx.backend.model
+        if not model:
+            return {"model": None, "media": [], "capabilities": []}
+        media = model_media(model)
+        cap_map = {"文本": "text", "图片": "image", "音频": "audio"}
+        return {
+            "model": Path(model).name,
+            "media": media.split("/"),
+            "capabilities": [cap_map[m] for m in media.split("/") if m in cap_map],
+            "mmproj": find_mmproj(model),
+        }
+
     @app.get("/help")
     async def help_():
         return {"endpoints": [
             {"method": "GET|POST", "path": "/v1/*", "desc": "OpenAI 兼容反代（X-Conversation-Id 落盘）"},
             {"method": "GET", "path": "/health", "desc": "前端存活 + 后端就绪"},
+            {"method": "GET", "path": "/api/capabilities", "desc": "当前模型媒体能力（文本/图片/音频）"},
             {"method": "GET", "path": "/status", "desc": "聚合状态（模型/上下文/性能/缓存）"},
             {"method": "POST", "path": "/shutdown", "desc": "优雅关闭（先落盘 KV 缓存）"},
             {"method": "POST", "path": "/model/load", "desc": "切换模型/上下文档位 ?model=&ctx="},
@@ -396,14 +524,26 @@ def create_app(actx: AppCtx) -> FastAPI:
         path = model
         if model.isdigit() and int(model) < len(models):
             path = models[int(model)]
-        if not path or not Path(path).exists():
+        if not path:
             return jerr(400, f"模型不存在：{model}")
+        # 文件或目录都解析到实际 gguf（目录取最大的主模型文件）
+        resolved = resolve_model_path(path)
+        if resolved is None:
+            return jerr(400, f"模型不存在：{path}")
+        path = resolved
         target_ctx = ctx if ctx in CTX_CHOICES else actx.cfg.get("default_ctx", 32768)
         try:
             await asyncio.to_thread(actx.backend.start, path, target_ctx)
         except (RuntimeError, TimeoutError) as e:
             return jerr(500, f"加载失败：{e}")
-        return {"model": path, "ctx": target_ctx, "ready": True}
+        # DSH 适配：同步配置中该模型的多模态声明（失败静默，不影响加载结果）
+        try:
+            note = await asyncio.to_thread(
+                sync_dsh_input, path, actx.cfg.get("port", 8080))
+        except Exception:
+            note = None
+        return {"model": path, "ctx": target_ctx, "ready": True,
+                "dsh": note}
 
     @app.post("/shutdown")
     async def shutdown():
@@ -487,22 +627,98 @@ def create_app(actx: AppCtx) -> FastAPI:
     return app
 
 
-def _delta_from_sse_line(line: str) -> tuple[str, str]:
+def _delta_from_sse_line(line: str) -> tuple[str, str, dict]:
+    """解析一行 SSE data：返回 (kind, delta, footer)。
+
+    kind ∈ {"reasoning", "content", ""}；footer = 无 choices 的
+    usage/timings 事件对象（cache 命中数据来源），否则 {}。
+    """
     if not line.startswith("data:"):
-        return ("", "")
+        return ("", "", {})
     data = line[5:].strip()
     if data == "[DONE]":
-        return ("", "")
+        return ("", "", {})
     try:
         obj = json.loads(data)
     except ValueError:
-        return ("", "")
-    try:
-        delta = obj["choices"][0].get("delta") or {}
-    except (KeyError, IndexError, TypeError):
-        return ("", "")
-    if delta.get("reasoning_content"):
-        return ("reasoning", delta["reasoning_content"])
-    if delta.get("content"):
-        return ("content", delta["content"])
-    return ("", "")
+        return ("", "", {})
+    choices = obj.get("choices")
+    if isinstance(choices, list) and choices:
+        delta = (choices[0].get("delta") or {}) if isinstance(choices[0], dict) else {}
+        if delta.get("reasoning_content"):
+            return ("reasoning", delta["reasoning_content"], {})
+        if delta.get("content"):
+            return ("content", delta["content"], {})
+        # finish_reason chunk（delta 为空）：include_usage=false 时 timings 挂在
+        # 这一行上（server-task.cpp L549），仍需作为 footer 收集
+        if "usage" in obj or "timings" in obj:
+            return ("", "", obj)
+        return ("", "", {})
+    # footer 事件：无 choices，携带 usage / timings
+    if "usage" in obj or "timings" in obj:
+        return ("", "", obj)
+    return ("", "", {})
+
+
+def _perf_from(t0: float, first_at: float | None, timings: dict) -> dict | None:
+    """由起点/首 token 时间与 footer timings 组装 perf 字典。
+
+    timings 字段（llama.cpp）：prompt_per_second / predicted_per_second 为
+    PP / TG 精确速率；first_at 缺失时用 prompt_ms 近似 TTFT。
+    """
+    perf: dict[str, Any] = {}
+    if first_at is not None:
+        perf["ttft_s"] = round(first_at - t0, 2)
+    elif timings.get("prompt_ms"):
+        perf["ttft_s"] = round(float(timings["prompt_ms"]) / 1000.0, 2)
+    if timings.get("prompt_per_second"):
+        perf["pp_tps"] = round(float(timings["prompt_per_second"]), 1)
+    if timings.get("predicted_per_second"):
+        perf["tg_tps"] = round(float(timings["predicted_per_second"]), 2)
+    if t0:
+        perf["dur_s"] = round(time.monotonic() - t0, 2)
+    return perf or None
+
+
+def _assistant_meta(actx: AppCtx, perf: dict | None, cache_n: int | None,
+                    prompt_n: int | None) -> dict:
+    """assistant 消息元数据：发起时间 / 模型 / 性能 / 缓存命中。
+
+    与 _MSG_FIELDS 白名单对齐，经 store 落盘后 /chat/get 原样带回。
+    """
+    meta: dict[str, Any] = {"created_at": time.strftime("%Y-%m-%d %H:%M:%S")}
+    model = actx.backend.model
+    if model:
+        meta["model"] = str(model).replace("\\", "/").split("/")[-1]
+    if perf:
+        meta["perf"] = dict(perf)
+    if cache_n is not None and prompt_n is not None and prompt_n > 0:
+        hits = min(int(cache_n), int(prompt_n))
+        meta["cache"] = {"hits": hits, "total": int(prompt_n),
+                         "pct": round(100.0 * hits / int(prompt_n), 1)}
+    return meta
+
+
+def _cache_numbers(obj: dict) -> tuple[int, int]:
+    """从响应对象（非流式响应 / 流式 footer）提取 (cached_tokens, total_prompt_tokens)。
+
+    语义：从 KV cache 恢复的 token 数 / 请求总 token 数。
+    cached 优先取规范字段 usage.prompt_tokens_details.cached_tokens（永远 <= total），
+    缺失时 fallback timings.cache_n；total = usage.prompt_tokens 或 prompt_n + cache_n。
+    """
+    usage = obj.get("usage") or {}
+    timings = obj.get("timings") or {}
+    total = int(usage.get("prompt_tokens") or 0)
+    cached = 0
+    ptd = usage.get("prompt_tokens_details")
+    if isinstance(ptd, dict):
+        cached = int(ptd.get("cached_tokens") or 0)
+    if not cached:
+        cached = int(usage.get("cache_tokens") or 0)
+    pn = int(timings.get("prompt_n") or 0)
+    cn = int(timings.get("cache_n") or 0)
+    if not total and (pn or cn):
+        total = pn + cn
+    if not cached and cn:
+        cached = cn
+    return min(cached, total), total

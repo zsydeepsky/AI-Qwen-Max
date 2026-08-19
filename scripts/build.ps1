@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   AI-Qwen-Max 构建脚本
   目标：裁剪构建 llama-server —— 只为本机（Ryzen AI Max+ 395 / gfx1151）+ Vulkan + 原生指令。

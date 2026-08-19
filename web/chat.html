@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>对话</title>
+<link rel="stylesheet" href="css/common.css">
+<link rel="stylesheet" href="css/chat.css">
+</head>
+<body>
+
+<div class="chat-layout">
+  <!-- 会话列表 -->
+  <aside class="chat-side" id="chatSide">
+    <div class="side-title">对话</div>
+    <button class="new-chat-btn" onclick="createNewChat()">＋ 新建对话</button>
+    <div class="conversation-list" id="convList">
+      <!-- Conversations loaded dynamically -->
+    </div>
+  </aside>
+
+  <!-- 聊天主区 -->
+  <main class="chat-main">
+    <header class="chat-topbar">
+      <button class="menu-btn" onclick="toggleChatSide()" style="display:none;background:none;border:none;font-size:20px;cursor:pointer;padding:4px;margin-right:8px;">☰</button>
+      <span id="sessionTitle">选择或新建对话</span>
+    </header>
+
+    <div class="messages-container" id="messagesContainer">
+      <div class="empty-state">
+        <div class="icon">💬</div>
+        <h2>欢迎使用 AI-Qwen-Max</h2>
+        <p>从左侧选择一个对话，或点击「新建对话」开始聊天。<br>支持上传图片和文档附件。</p>
+      </div>
+    </div>
+
+    <div class="input-area" id="inputArea">
+      <div class="input-wrapper">
+        <button class="upload-btn" onclick="document.getElementById('fileInput').click()" title="上传附件">📎</button>
+        <input type="file" id="fileInput" multiple accept="image/*,.pdf,.doc,.docx,.txt,.md,.csv,.json,.py,.js,.html,.css,.zip" style="display:none" onchange="handleFileSelect(event)">
+        <div class="input-box">
+          <textarea id="messageInput" placeholder="输入消息... (Shift+Enter 换行，Enter 发送)" rows="1"></textarea>
+          <div class="media-preview" id="mediaPreview"></div>
+        </div>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">发送</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/chat.js"></script>
+</body>
+</html>

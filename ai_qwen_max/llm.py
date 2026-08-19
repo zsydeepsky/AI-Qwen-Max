@@ -51,20 +51,59 @@ class GenResult:
         return self.decode_tps
 
 
-def reasoning_kwargs(effort: str) -> dict[str, Any]:
-    """思考控制。off → 显式关闭；其余 → chat_template_kwargs.reasoning_effort（模板侧分档：
-    xhigh(默认)/medium/low，模板大小写敏感，必须小写；顶层 reasoning_effort 字段
-    server 只认 "none"，其余值被忽略——所以必须走 kwargs 通道）。"""
+def template_supports_effort(tpl: str | None) -> bool:
+    """模板是否原生支持 reasoning_effort 档位（qwen35 等新模板有，qwen35moe 无）。"""
+    return bool(tpl) and "reasoning_effort" in tpl
+
+
+# 模板不支持 reasoning_effort 时的降级档位指令：以 system 消息注入，
+# 文案模仿 qwen35 模板的 reasoning_instructions（英文，Qwen3 思考习惯英语）。
+EFFORT_SYSTEM_HINT = {
+    "low": (
+        "Reasoning effort is set to low. Keep your thinking brief and focused, "
+        "moving directly to the conclusion without unnecessary elaboration."
+    ),
+    "medium": (
+        "Reasoning effort is set to medium. Think through the task step by step "
+        "before answering, but avoid excessive detail and stay concise."
+    ),
+    "xHigh": (
+        "Reasoning effort is set to xhigh. Please think carefully through the task, "
+        "validate key assumptions, consider plausible alternatives, and prioritize "
+        "correctness, consistency, and clarity in the final answer."
+    ),
+}
+
+
+def effort_chat_kwargs(effort: str, tpl: str | None) -> dict[str, Any]:
+    """按模板能力返回 chat_template_kwargs。
+
+    off → 显式关闭思考（enable_thinking，模板通用）；
+    模板支持 reasoning_effort → 走模板档位（xhigh/medium/low，大小写敏感必须小写）；
+    模板不支持 → 退回开启思考，档位靠 system 指令（effort_system_injection）体现。
+    """
     if effort in ("off", "none"):
-        return {"chat_template_kwargs": {"enable_thinking": False}}
-    if effort in ("low", "medium", "xHigh"):
-        return {"chat_template_kwargs": {"reasoning_effort": effort.lower()}}
-    return {}
+        return {"enable_thinking": False}
+    if template_supports_effort(tpl):
+        return {"reasoning_effort": effort.lower()}
+    return {"enable_thinking": True}
 
 
-# 思考预算按 effort 档绑定 context window 百分比：
+def effort_system_injection(effort: str, tpl: str | None) -> str | None:
+    """模板不支持 reasoning_effort 时，返回应注入头部 system 的档位指令；否则 None。"""
+    if effort in ("off", "none") or template_supports_effort(tpl):
+        return None
+    return EFFORT_SYSTEM_HINT.get(effort)
+
+
+# 思考预算按 effort 档绑定"输出窗口"百分比：
 # off = 思考关闭；其余档位在消耗到预算 80% 时注入诱导语，100% 时强制 </think>
-EFFORT_THINK_PCT = {"off": 0.0, "low": 0.10, "medium": 0.25, "xHigh": 0.50}
+# 输出窗口 = min(max_tokens, ctx) − prompt_token − 模板余量（见 _think_budget）
+EFFORT_THINK_PCT = {"off": 0.0, "low": 0.03, "medium": 0.10, "xHigh": 0.30}
+
+# 模板/system/think 标记等非对话内容 token 开销余量，从输出窗口中扣除，
+# 避免 prompt 占满 ctx 时预算仍虚高、软注入永远没有触发空间
+TEMPLATE_OVERHEAD = 256
 
 # 诱导语：第一人称自嗓音（Qwen3 CoT 原生分布），
 # 以 Qwen3 收尾公式 "Okay, let me ... write the final answer" 结尾，
@@ -93,7 +132,44 @@ class LLM:
     def __init__(self, backend, effort: str = "low", ctx: int = 0):
         self.backend = backend   # Backend 实例
         self.effort = effort
-        self.ctx = ctx           # context window（tokens），思考预算 = ctx × effort 档百分比
+        self.ctx = ctx           # context window（tokens）；思考预算 = 输出窗口 × effort 档百分比
+
+    # ---- 思考预算 ----
+
+    def _prompt_tokens(self, messages: list[dict]) -> int | None:
+        """请求前 tokenize 拼接文本，拿 prompt 近似 token 数（用于预算缩放）。
+
+        llama-server 原生 POST /tokenize；失败（后端未起/超时）返回 None，
+        调用方回退旧逻辑 ctx×pct。
+        """
+        try:
+            parts = []
+            for m in messages:
+                c = m.get("content", "")
+                parts.append(c if isinstance(c, str) else json.dumps(c, ensure_ascii=False))
+            r = self.backend.post("/tokenize",
+                                  json={"content": "\n".join(parts), "add_special": False},
+                                  timeout=30)
+            r.raise_for_status()
+            return int(r.json().get("count", 0))
+        except Exception:
+            return None
+
+    def _think_budget(self, messages: list[dict], max_tokens: int) -> int:
+        """思考预算 = 输出窗口 × effort 档百分比。
+
+        输出窗口 = min(max_tokens(若>0), ctx) − prompt_token − 模板余量。
+        prompt 越长预算越小：软注入（80%）永远有触发空间，思考不会烧到上下文墙。
+        """
+        pct = EFFORT_THINK_PCT.get(self.effort, 0.0)
+        if pct <= 0 or not self.ctx:
+            return 0
+        ceiling = min(max_tokens, self.ctx) if max_tokens and max_tokens > 0 else self.ctx
+        prompt_n = self._prompt_tokens(messages)
+        if prompt_n is None:
+            return int(self.ctx * pct)             # tokenize 失败：回退旧逻辑
+        avail = max(0, ceiling - prompt_n - TEMPLATE_OVERHEAD)
+        return int(avail * pct)
 
     # ---- CLI 流式对话 ----
 
@@ -105,15 +181,20 @@ class LLM:
 
         若传入 `result`，本方法会把 usage/timings 写进去（CLI 调用者应始终传）。
         """
+        # 模板不支持 reasoning_effort 时，把档位降级为头部 system 指令注入
+        tpl = getattr(self.backend, "chat_template", None)
+        hint = effort_system_injection(self.effort, tpl)
+        msgs = list(messages)
+        if hint:
+            msgs.insert(0, {"role": "system", "content": hint})
         payload = {
             "model": "default",
-            "messages": messages,
+            "messages": msgs,
             "stream": True,
             "temperature": temperature,
             "max_tokens": max_tokens,
-            **reasoning_kwargs(self.effort),
-            **think_budget_kwargs(self.effort,
-                                  int(self.ctx * EFFORT_THINK_PCT.get(self.effort, 0.0))),
+            "chat_template_kwargs": effort_chat_kwargs(self.effort, tpl),
+            **think_budget_kwargs(self.effort, self._think_budget(msgs, max_tokens)),
         }
         with httpx.stream("POST", f"{self.backend.base_url}/v1/chat/completions",
                           json=payload, timeout=httpx.Timeout(600, connect=10)) as r:

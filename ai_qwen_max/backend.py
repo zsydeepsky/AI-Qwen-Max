@@ -12,11 +12,12 @@ from typing import Any
 import httpx
 
 from .config import Config
-from .gguf import nextn_layer_count
+from .gguf import chat_template, find_mmproj, model_max_output, nextn_layer_count
+from .llm import EFFORT_THINK_PCT, THINK_NUDGE
 
 PARALLEL = 3          # slot 数：2 路 API + 1 路 CLI/Web
 READY_TIMEOUT_S = 600  # 大模型冷加载宽限
-SHUTDOWN_GRACE_S = 30
+SHUTDOWN_GRACE_S = 60  # 含 uvicorn 退出钩子落盘 KV 缓存的耗时，30s 对 384K×3 上下文不够
 
 # llama-server 打印实际监听地址的行（HTTP bind 在模型加载前，但此 INFO 行在加载后输出）
 _LISTEN_RE = re.compile(rb"listening on http://[^:/\s]+:(\d+)")
@@ -34,12 +35,16 @@ class Backend:
         self.model: str | None = None
         self.ctx: int | None = None
         self.port = None
+        # 当前模型的 GGUF 内嵌 chat_template（build_cmd 时探测一次）。
+        # None 表示未加载或读取失败；用于判定模板是否支持 reasoning_effort 档位。
+        self.chat_template: str | None = None
         self._client: httpx.Client | None = None
 
     # ---- 进程生命周期 ----
 
     def build_cmd(self, model: str, ctx: int) -> list[str]:
         cfg = self.cfg
+        self.chat_template = chat_template(model)   # 探测模板能力（reasoning_effort 降级用）
         cmd = [
             str(self.server_exe),
             "--model", model,
@@ -51,7 +56,13 @@ class Backend:
             "--threads", str(cfg["threads"]),
             "--ubatch-size", str(cfg["ubatch"]),
             "--flash-attn", "on",
-            # KV 量化锚定 K8V8（q8_0/q8_0）—— 生产定论
+        ]
+        # 多模态：模型同目录有配套 mmproj（LM Studio 下载惯例）则挂上视觉塔；
+        # 纯文本模型无此文件，自动跳过
+        mmproj = find_mmproj(model)
+        if mmproj:
+            cmd += ["--mmproj", mmproj]
+        cmd += [
             "--cache-type-k", "q8_0",
             "--cache-type-v", "q8_0",
             "--parallel", str(PARALLEL),
@@ -64,6 +75,19 @@ class Backend:
             "--cache-ssd-ttl-hours", str(cfg["cache_ssd_ttl_hours"]),
             "--verbosity", str(cfg["verbosity"]),
         ]
+        # 思考预算：effort 档 × min(模型最大输出, ctx) 作为引擎级默认，覆盖所有客户端——
+        # DSH/Web 等第三方调用方不会在请求体里带 reasoning_budget_tokens，若只靠 llm.py
+        # 的请求级注入，它们永远没有预算（server 默认 -1 = 不限制）。
+        # GGUF 读不到 max output 时按 32K 兜底；CLI 请求仍会用 llm.py 按"输出窗口"
+        # 算的精确预算覆盖（请求级字段优先）。
+        pct = EFFORT_THINK_PCT.get(cfg.get("reasoning_effort", "low"), 0.0)
+        budget = int(min(model_max_output(model), ctx) * pct)
+        cmd += ["--reasoning-budget", str(budget)]
+        if budget > 0:
+            cmd += [
+                "--reasoning-budget-soft-message", THINK_NUDGE,
+                "--reasoning-budget-soft-ratio", "0.8",
+            ]
         # 投机解码：仅当模型内嵌 MTP (nextn) 层
         if cfg.get("use_mtp", True) and nextn_layer_count(model) > 0:
             cmd += ["--spec-type", "draft-mtp"]
@@ -139,19 +163,36 @@ class Backend:
         raise TimeoutError("llama-server 就绪超时")
 
     def stop(self) -> None:
-        """优雅退出：POST /max/shutdown（Windows 跨进程信号不可靠），超时硬杀。"""
-        if self.proc and self.proc.poll() is None:
+        """优雅退出：POST /max/shutdown（Windows 跨进程信号不可靠），超时硬杀。
+
+        uvicorn 退出钩子会先落盘 KV 缓存到 SSD（384K×3 上下文可能耗时数十秒），
+        wait 宽限已覆盖该耗时；硬杀后仍不退出的进程直接放弃——
+        任何路径都不抛异常，退出流程不被 TimeoutExpired 打断。
+        """
+        try:
+            if self.proc is not None and self.proc.poll() is None:
+                if self._client is not None:
+                    try:
+                        self._client.post("/max/shutdown", timeout=15)
+                    except (httpx.HTTPError, OSError):
+                        pass
+                try:
+                    self.proc.wait(timeout=SHUTDOWN_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    # 硬杀兜底；kill 后仍不退出的进程直接放弃，避免阻塞退出流程
+                    try:
+                        self.proc.kill()
+                        self.proc.wait(timeout=10)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
+        finally:
             if self._client is not None:
                 try:
-                    self._client.post("/max/shutdown", timeout=5)
-                except httpx.HTTPError:
+                    self._client.close()
+                except Exception:
                     pass
-            try:
-                self.proc.wait(timeout=SHUTDOWN_GRACE_S)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=10)
-        self.proc = None
+                self._client = None
+            self.proc = None
 
     # ---- HTTP 便捷 ----
 

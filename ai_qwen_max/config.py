@@ -13,6 +13,8 @@ CTX_CHOICES = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "models": [],                # GGUF 绝对路径列表
+    "default_model": "",         # 上次交互选中的模型（启动时 Enter 直接使用）
+    "lang": "zh",                # 界面语言 zh | en
     "default_ctx": 32768,        # 新会话默认档位
     "verbosity": 3,              # llama-server 日志级别（4 = slot 级 trace）
     "port": 8080,                # 前端 HTTP（CLI 启动时可改）
@@ -23,7 +25,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cache_ssd_ttl_hours": 24,   # SSD 条目存活时间
     "avail_mem_min_gb": 4,       # 系统可用内存低于此值不做主动驱逐判断
     "cache_ram_target_gb": 16,   # RAM 池软上限（驱逐参考）
-    "reasoning_effort": "low",   # off | low | medium | xHigh（思考预算按档绑定 ctx 百分比：10%/25%/50%）
+    "reasoning_effort": "low",   # off | low | medium | xHigh（思考预算按档绑定 max_output 百分比：3%/10%/30%）
     "use_mtp": True,             # 投机解码（模型支持 nextn 时自动启用）
 }
 

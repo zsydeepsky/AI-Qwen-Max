@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>运行状态</title>
+<link rel="stylesheet" href="css/common.css">
+<link rel="stylesheet" href="css/status.css">
+</head>
+<body>
+
+<div class="status-page">
+  <header class="page-header">
+    <span class="page-title">⚙ 运行状态</span>
+    <span class="sp-ready-dot" id="spReadyDot"></span>
+    <span class="spacer"></span>
+    <label class="sp-auto" title="每 5 秒自动刷新">
+      <input type="checkbox" id="autoRefresh" checked> 自动刷新
+    </label>
+    <button class="btn" id="refreshBtn" onclick="loadStatus()">刷新</button>
+  </header>
+  <div id="statusContent" class="status-grid">
+    <div class="empty-state">
+      <div class="icon">📊</div>
+      <h2>正在获取状态…</h2>
+    </div>
+  </div>
+</div>
+
+<script src="js/common.js"></script>
+<script src="js/status.js"></script>
+</body>
+</html>

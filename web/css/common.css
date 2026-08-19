@@ -1,0 +1,208 @@
+/* ===== 主题变量（所有页面共享） ===== */
+:root {
+  --bg: #f8f9fa;
+  --surface: #ffffff;
+  --border: #e2e5e9;
+  --text: #1a1d23;
+  --text-secondary: #6b7280;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --user-bubble: #4f46e5;
+  --user-text: #ffffff;
+  --assistant-bubble: #ffffff;
+  --thinking-bg: #f0f1f5;
+  --thinking-border: #d1d5db;
+  --code-bg: #1e1e2e;
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --ok-bg: #dcfce7;
+  --ok-fg: #166534;
+  --warn-bg: #fef3c7;
+  --warn-fg: #92400e;
+  --err-bg: #fee2e2;
+  --err-fg: #b91c1c;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.08);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.1);
+  --radius: 12px;
+  --radius-sm: 8px;
+  --font-mono: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Noto Sans SC', sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+/* ===== 滚动条 ===== */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #9ca3af; }
+
+/* ===== Toast ===== */
+.toast-container {
+  position: fixed;
+  top: 20px;
+  right: 20px;
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.toast {
+  padding: 10px 16px;
+  background: var(--text);
+  color: #fff;
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  box-shadow: var(--shadow-md);
+  animation: toast-in 0.3s ease, toast-out 0.3s ease 2.7s forwards;
+}
+
+@keyframes toast-in {
+  from { transform: translateX(100%); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+
+@keyframes toast-out {
+  to { opacity: 0; transform: translateY(-8px); }
+}
+
+/* ===== 状态点 / 健康指示 ===== */
+.connection-status {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--danger);
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.connection-status.connected {
+  background: #22c55e;
+}
+
+.health-indicator {
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 20px;
+  background: var(--warn-bg);
+  color: var(--warn-fg);
+  white-space: nowrap;
+}
+
+.health-indicator.ready {
+  background: var(--ok-bg);
+  color: var(--ok-fg);
+}
+
+/* ===== 通用按钮 ===== */
+.btn {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border-color: var(--accent);
+}
+
+.btn-primary:hover {
+  background: var(--accent-hover);
+  border-color: var(--accent-hover);
+  color: #fff;
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: #fff;
+  border-color: var(--danger);
+}
+
+.btn-danger:hover {
+  background: var(--danger-hover);
+  border-color: var(--danger-hover);
+  color: #fff;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* ===== 页面通用头部条 ===== */
+.page-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  font-size: 14px;
+}
+
+.page-header .page-title {
+  font-weight: 600;
+}
+
+.page-header .spacer {
+  flex: 1;
+}
+
+/* ===== 空状态 ===== */
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  text-align: center;
+  padding: 40px;
+}
+
+.empty-state .icon { font-size: 64px; margin-bottom: 16px; }
+.empty-state h2 { font-size: 20px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.empty-state p { font-size: 14px; max-width: 400px; line-height: 1.6; }
+
+/* ===== 打字指示器 ===== */
+.typing-indicator {
+  display: inline-flex;
+  gap: 4px;
+  padding: 8px 0;
+}
+
+.typing-indicator span {
+  width: 6px;
+  height: 6px;
+  background: var(--text-secondary);
+  border-radius: 50%;
+  animation: bounce 1.4s infinite ease-in-out both;
+}
+
+.typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
+.typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
+
+@keyframes bounce {
+  0%, 80%, 100% { transform: scale(0); }
+  40% { transform: scale(1); }
+}

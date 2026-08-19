@@ -10,14 +10,19 @@
 
 from __future__ import annotations
 
+import json
+import shutil
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
 from .backend import Backend
 from .config import CTX_CHOICES, Config
+from .dsh import sync_dsh_input
+from .gguf import model_max_output, model_media, resolve_model_path
 from .llm import EFFORT_THINK_PCT, GenResult, LLM
 from .store import Session, SessionStore
 
@@ -78,11 +83,12 @@ STR = {
         "del_confirm": "确认删除「{t}」？(y/n，ESC=n) ",
         "del_done": "已删除会话「{t}」（引擎缓存按 TTL 自然过期）。",
         "del_no": "已取消。",
-        "log_title": "── API 实时日志（ESC/q 返回选单）──",
-        "log_hint": "（显示前端 HTTP 服务收到的请求与引擎返回；CLI 自身对话直连引擎不经过此处）",
+        "log_title": "── API 实时日志（ESC 返回选单）──",
+        "log_hint": "（显示前端 HTTP 服务收到的请求与 CLI 自身对话；CLI 对话直连引擎，事件在此补齐）",
         "log_pending": "[{ts}] {method} {path} …",
         "log_line": "[{ts}] {method} {path} → {status} · {dur}s",
         "log_err": "[{ts}] {method} {path} ✗ {err}",
+        "log_cache": "↳ cache 命中 {c}/{t}（{pct}）",
         "err_invalid": "无效输入，重试。",
     },
     "en": {
@@ -131,13 +137,33 @@ STR = {
         "del_done": "Deleted session \"{t}\" (engine cache ages out via TTL).",
         "del_no": "Cancelled.",
         "log_title": "── Live API log (ESC to return) ──",
-        "log_hint": "(Requests received by the frontend HTTP service and engine responses; CLI chats go direct to the engine)",
+        "log_hint": "(Requests to the frontend HTTP service plus CLI chats; CLI chats hit the engine directly and are recorded here)",
         "log_pending": "[{ts}] {method} {path} ...",
         "log_line": "[{ts}] {method} {path} → {status} · {dur}s",
         "log_err": "[{ts}] {method} {path} ✗ {err}",
+        "log_cache": "↳ cache hit {c}/{t} ({pct})",
         "err_invalid": "Invalid input, retry.",
     },
 }
+
+
+def _flush_input_buffer() -> None:
+    """清空 Windows 控制台输入缓冲。
+
+    模型加载等长耗时阶段用户误按的回车/按键会被控制台缓冲，
+    进入功能选单后 _read_line_esc 会逐个消费并连打多个选单提示；
+    此处一次性丢弃残留，保证进入选单时是干净状态。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        if h is not None and h != -1:
+            k32.FlushConsoleInputBuffer(h)
+    except Exception:
+        pass
 
 
 def _set_title(text: str) -> None:
@@ -362,12 +388,12 @@ class Cli:
         self.frontend_port = frontend_port   # 轮询 /api/stats 的本地端口
         self.lang = str(cfg.get("lang", "zh"))
         self.llm = LLM(backend, effort=str(cfg.get("reasoning_effort", "low")))
-        # 标题栏刷新：后台线程轮询 /api/stats，写入快照，状态突变时推新标题
+        # 标题栏刷新：后台线程轮询 /api/stats，推理中显示实时 tps，空闲退回最近一轮精确 perf
         self._title_thread: threading.Thread | None = None
         self._title_stop = threading.Event()
-        self._title_state: dict = {}  # 最近一次 phase/tps 缓存，避免频繁刷 title
-        self._last_status = ""        # 最近一轮精确 perf（footer），idle 状态位展示
-        self._last_cache: dict = {}   # 最近一次 /api/stats 的 cache 段（拼标题用）
+        self._stats_client = None       # 轮询 /api/stats 的 httpx 客户端（懒创建）
+        self._last_status = ""          # 最近一轮精确 perf（footer），idle 状态位展示
+        self._last_cache: dict = {}     # 最近一次 /api/stats 的 cache 段（拼标题用）
 
     def L(self, key: str, **kw: Any) -> str:
         s = STR.get(self.lang, STR["zh"]).get(key, key)
@@ -421,7 +447,7 @@ class Cli:
             ctx = self._select_ctx(ctx_preset)
             ctx_preset = 0
             effort = self._select_effort()
-            self.llm.ctx = ctx     # 思考预算 = ctx × effort 档百分比（off=0/low=10%/medium=25%/xHigh=50%）
+            self.llm.ctx = ctx     # CLI 精确预算 = 输出窗口 × effort 档（off=0/low=3%/medium=10%/xHigh=30%）
             err, dur = self._load(model, ctx)
             if err is not None:
                 print(self.L("load_fail", e=err))
@@ -434,11 +460,10 @@ class Cli:
             self._menu_loop()
         finally:
             self._stop_title_updater()
-            _set_title("AI-Qwen-Max | idle")
+            _set_title("idle")
 
     def _start_title_updater(self) -> None:
-        import httpx as _h
-        self._client = _h.Client(base_url=f"http://127.0.0.1:{self.frontend_port}", timeout=2)
+        self._title_stop.clear()
         self._title_thread = threading.Thread(target=self._title_loop, daemon=True)
         self._title_thread.start()
 
@@ -448,14 +473,13 @@ class Cli:
             self._title_thread.join(timeout=2.0)
 
     def _title_loop(self) -> None:
-        """标题栏状态机（1s 采样 /api/stats）：
-           推理中：差分 slot 计数估算实时 tps；
-           空闲：状态位退回最近一轮 footer 精确 perf（_last_status），每 5s 刷一次。
-           统一格式见 _format_title。
+        """标题栏后台线程：1s 采样 /api/stats。
+
+        推理中（prefill/decode）用两帧差分估算实时速率；
+        空闲立即退回最近一轮 footer 精确 perf（_last_status）。
         """
         prev: dict | None = None
         prev_ts = 0.0
-        idle_gap = 0
         while not self._title_stop.is_set():
             snap = self._fetch_stats()
             ts = time.monotonic()
@@ -463,51 +487,43 @@ class Cli:
                 prev = None
                 self._title_stop.wait(2.0)
                 continue
-            es = snap.get("engine_state") or {}
-            phase = es.get("phase", "idle")
             cache = snap.get("cache") or {}
             if cache:
                 self._last_cache = cache
-            pp = es.get("prefill") or {}
-            dc = es.get("decode") or {}
+            es = snap.get("engine_state") or {}
+            phase = es.get("phase", "idle")
             if phase == "prefill":
-                idle_gap = 0
-                proc = int(pp.get("processed") or 0)
-                pct = pp.get("pct") or 0.0
-                tps: float | None = None
-                if prev and prev_ts:
-                    prev_proc = int(((prev.get("engine_state") or {}).get("prefill") or {}).get("processed") or 0)
-                    dt = ts - prev_ts
-                    if dt > 0 and proc > prev_proc:
-                        tps = round((proc - prev_proc) / dt, 1)
-                status = f"PP {tps} t/s {pct}%" if tps is not None else f"PP {pct}%"
+                status = self._phase_status("PP", prev, prev_ts, es.get("prefill") or {}, ts)
             elif phase == "decode":
-                idle_gap = 0
-                dec = int(dc.get("decoded") or 0)
-                tps2 = None
-                if prev and prev_ts:
-                    prev_dec = int(((prev.get("engine_state") or {}).get("decode") or {}).get("decoded") or 0)
-                    dt = ts - prev_ts
-                    if dt > 0 and dec > prev_dec:
-                        tps2 = round((dec - prev_dec) / dt, 1)
-                status = f"TG {tps2} t/s" if tps2 is not None else "TG"
+                status = self._phase_status("TG", prev, prev_ts, es.get("decode") or {}, ts)
             else:
-                idle_gap += 1
-                if idle_gap < 5:
-                    prev = snap
-                    prev_ts = ts
-                    self._title_stop.wait(1.0)
-                    continue
-                idle_gap = 0
                 status = self._last_status or "idle"
-            _set_title(self._format_title(status, cache))
+            _set_title(self._format_title(status, self._last_cache))
             prev = snap
             prev_ts = ts
             self._title_stop.wait(1.0)
 
+    @staticmethod
+    def _phase_status(label: str, prev: dict | None, prev_ts: float,
+                      cur: dict, ts: float) -> str:
+        """两帧采样差分估算实时速率；PP 附处理进度 pct。prev 缺失时退化为只显状态。"""
+        key = "prefill" if label == "PP" else "decode"
+        cur_n = int(cur.get("processed" if label == "PP" else "decoded") or 0)
+        tps: float | None = None
+        if prev and prev_ts:
+            prev_n = int(((prev.get("engine_state") or {}).get(key) or {})
+                         .get("processed" if label == "PP" else "decoded") or 0)
+            dt = ts - prev_ts
+            if dt > 0 and cur_n > prev_n:
+                tps = (cur_n - prev_n) / dt
+        if label == "PP":
+            pct = cur.get("pct") or 0.0
+            return f"PP {tps:.1f} t/s {pct}%" if tps is not None else f"PP {pct}%"
+        return f"TG {tps:.1f} t/s" if tps is not None else "TG"
+
     def _format_title(self, status: str, cache: dict) -> str:
-        """标题栏统一格式：
-           AI-Qwen-Max | model | 状态 | cache 命中% | hit 命中token | RAM | SSD | paralle
+        """标题栏格式（宽度宝贵，无项目前缀）：
+           model | 状态 | cache 命中% | hit | RAM | SSD | slot n
         """
         model = Path(self.backend.model).stem if self.backend.model else "no-model"
         hit = cache.get("recent_hit_pct")
@@ -515,7 +531,7 @@ class Cli:
         ram = _fmt_bytes((cache.get("ram_pool") or {}).get("bytes", 0))
         ssd = _fmt_bytes((cache.get("ssd_pool") or {}).get("bytes", 0))
         npar = cache.get("n_slots") or 0
-        bits = ["AI-Qwen-Max", model, status]
+        bits = [model, status]
         if hit:
             bits.append(f"cache {hit}%")
         if hit_tok:
@@ -523,12 +539,16 @@ class Cli:
         bits.append(f"RAM {ram}")
         bits.append(f"SSD {ssd}")
         if npar:
-            bits.append(f"paralle {npar}")
+            bits.append(f"slot {npar}")
         return " | ".join(bits)
 
     def _fetch_stats(self) -> dict | None:
+        if self._stats_client is None:
+            import httpx as _h
+            self._stats_client = _h.Client(
+                base_url=f"http://127.0.0.1:{self.frontend_port}", timeout=2)
         try:
-            r = self._client.get("/api/stats")
+            r = self._stats_client.get("/api/stats")
             return r.json() if r.status_code == 200 else None
         except Exception:
             return None
@@ -536,9 +556,11 @@ class Cli:
     def _print_header(self, model: str, ctx: int, effort: str) -> None:
         ctx_label = f"{ctx // 1024}K"
         pct = EFFORT_THINK_PCT.get(effort, 0.0)
-        budget = int(ctx * pct)
+        budget = int(min(model_max_output(model), ctx) * pct)   # 与引擎启动默认同口径
         effort_label = effort if pct <= 0 else f"{effort}·think {budget // 1024}K"
-        print("\n" + _CYAN + self.L("hdr_loaded", model=Path(model).name,
+        media = model_media(model)   # 文本/图片/音频
+        name = f"{Path(model).name} [{media}]"
+        print("\n" + _CYAN + self.L("hdr_loaded", model=name,
                                      ctx=ctx_label, effort=effort_label) + _RESET)
 
     # ---- 语言 ----
@@ -565,43 +587,57 @@ class Cli:
 
     # ---- 模型（序号选已有 / 输路径新增，参照旧版设计） ----
 
+    def _remember_model(self, p: str) -> None:
+        """记下本次选中的模型为默认（下次 Enter 直接使用）。"""
+        self.cfg.data["default_model"] = p
+        self.cfg.save()
+
     def _select_model(self, preset: str = "") -> str:
         while True:
             models = [m for m in (self.cfg.get("models") or []) if Path(m).exists()]
+            saved = self.cfg.get("default_model", "")
+            saved = saved if saved in models else ""
             print(f"\n===== {self.L('model_title')} =====")
             if models:
                 for i, m in enumerate(models, 1):
-                    print(f"  {i}. {m}")
+                    mark = " (Enter)" if m == saved else ""
+                    print(f"  {i}. {m}{mark}")
             else:
                 print(self.L("model_empty"))
             print(f"  {self.L('quit')}")
             if preset:
                 if preset.isdigit() and 1 <= int(preset) <= len(models):
                     return models[int(preset) - 1]
-                if Path(preset).exists():
-                    return preset
+                r = resolve_model_path(preset)
+                if r is not None:
+                    return r
             raw, esc = _read_line_esc(self.L("model_prompt"))
             if esc:
                 raise SystemExit(0)
             raw = raw.strip().strip('"').strip("'")   # 兼容拖拽带引号路径
             if not raw:
+                if saved:
+                    return saved                      # Enter = 上次选的模型
                 continue
             if raw.isdigit() and not Path(raw).exists():
                 i = int(raw) - 1
                 if not (0 <= i < len(models)):
                     print(self.L("model_bad_idx", n=len(models)))
                     continue
-                return models[i]
-            p = str(Path(raw).expanduser().resolve())
-            if not Path(p).exists():
-                print(self.L("model_not_file", p=p))
+                pick = models[i]
+                self._remember_model(pick)
+                return pick
+            # 文件或目录都解析到实际 gguf（目录取最大的主模型文件）
+            p = resolve_model_path(raw)
+            if p is None:
+                print(self.L("model_not_file", p=str(Path(raw).expanduser().resolve())))
                 continue
             if p not in models and p.lower().endswith(".gguf"):
                 registered = list(self.cfg.get("models") or [])
                 registered.append(p)
                 self.cfg.data["models"] = registered
-                self.cfg.save()
                 print(_dim(self.L("model_registered")))
+            self._remember_model(p)
             return p
 
     # ---- 上下文档位 ----
@@ -621,10 +657,15 @@ class Cli:
                 raise SystemExit(0)
             raw = raw.strip()
             if not raw:
-                return CTX_CHOICES[di]
-            if raw.isdigit() and 1 <= int(raw) <= len(CTX_CHOICES):
-                return CTX_CHOICES[int(raw) - 1]
-            print(self.L("err_invalid"))
+                pick = CTX_CHOICES[di]
+            elif raw.isdigit() and 1 <= int(raw) <= len(CTX_CHOICES):
+                pick = CTX_CHOICES[int(raw) - 1]
+            else:
+                print(self.L("err_invalid"))
+                continue
+            self.cfg.data["default_ctx"] = pick   # 记住本次档位：下次 Enter 直接用
+            self.cfg.save()
+            return pick
 
     # ---- 思考强度 ----
 
@@ -657,7 +698,7 @@ class Cli:
 
     def _load(self, model: str, ctx: int) -> tuple[str | None, float]:
         """返回 (错误信息|None, 耗时秒)。"""
-        _set_title("AI-Qwen-Max | loading...")
+        _set_title(f"loading {Path(model).stem}...")
         stop = threading.Event()
         t0 = time.monotonic()
 
@@ -681,11 +722,21 @@ class Cli:
         stop.set()
         th.join()
         sys.stdout.write("\r" + " " * 60 + "\r")   # 清掉 spinner 行
+        if err is None:
+            # DSH 适配：同步配置中该模型的多模态声明（无 DSH 环境/失败均静默）
+            try:
+                note = sync_dsh_input(model, self.cfg.get("port", 8080))
+            except Exception:
+                note = None
+            if note:
+                print(f"  {note}")
         return err, time.monotonic() - t0
 
     # ================= 功能选单 =================
 
     def _menu_loop(self) -> None:
+        # 丢弃载入/等待期间的残留按键（否则会连打多个选单提示）
+        _flush_input_buffer()
         while True:
             print(f"\n===== {self.L('menu_title')} =====")
             print(f"  1. {self.L('menu_chat')}")
@@ -757,7 +808,7 @@ class Cli:
                 session.meta["title"] = title_src
                 session.save_meta()
 
-        _set_title("AI-Qwen-Max | generating...")
+        _set_title("generating...")
         poller = InterruptPoller()
         poller.start()
         shown_reasoning = 0
@@ -805,6 +856,27 @@ class Cli:
         assistant: dict[str, Any] = {"role": "assistant", "content": res.content}
         if res.reasoning:
             assistant["reasoning_content"] = res.reasoning
+        # 元数据：发起时间 / 模型 / 性能 / 缓存命中（与 _MSG_FIELDS 白名单对齐落盘）
+        res.dur_s = time.monotonic() - t0
+        assistant["created_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        model = getattr(self.backend, "model", None)
+        if model:
+            assistant["model"] = str(model).replace("\\", "/").split("/")[-1]
+        perf: dict[str, Any] = {}
+        if res.ttft_s is not None:
+            perf["ttft_s"] = round(res.ttft_s, 2)
+        if res.prefill_tps:
+            perf["pp_tps"] = round(res.prefill_tps, 1)
+        if res.decode_tps:
+            perf["tg_tps"] = round(res.decode_tps, 2)
+        if res.dur_s is not None:
+            perf["dur_s"] = round(res.dur_s, 2)
+        if perf:
+            assistant["perf"] = perf
+        if res.cache_tokens and res.prompt_tokens:
+            hits = min(res.cache_tokens, res.prompt_tokens)
+            assistant["cache"] = {"hits": hits, "total": res.prompt_tokens,
+                                  "pct": round(100.0 * hits / res.prompt_tokens, 1)}
         if res.content or res.reasoning:
             session.append(assistant)
         interrupted_perf = poller.interrupt.is_set()
@@ -820,6 +892,38 @@ class Cli:
         if parts:
             self._last_status = " · ".join(parts)
         _set_title(self._format_title(self._last_status or "idle", self._last_cache))
+        # 本轮对话写入日志页事件流（含缓存命中数据，功能选单 3 可查看）
+        self._emit_turn_event(session, res, t0)
+
+    def _emit_turn_event(self, session: Session, res: GenResult, t0: float) -> None:
+        """把 CLI 自身对话作为一条 API 事件记录进日志页。
+
+        CLI 对话直连 llama-server 不经过 8080 反代，事件流里本来没有它；
+        这里手动补齐，让日志页能显示每轮的缓存命中数据。
+        """
+        try:
+            body = json.dumps({"stream": True, "messages": session.messages},
+                              ensure_ascii=False)
+            rec = self.events.begin(uuid.uuid4().hex[:12], "POST",
+                                    "/v1/chat/completions", body)
+            perf: dict[str, Any] = {}
+            if res.ttft_s is not None:
+                perf["ttft_s"] = round(res.ttft_s, 2)
+            if res.prefill_tps:
+                perf["pp_tps"] = round(res.prefill_tps, 1)
+            if res.decode_tps:
+                perf["tg_tps"] = round(res.decode_tps, 2)
+            if res.dur_s is not None:
+                perf["dur_s"] = round(res.dur_s, 2)
+            rec = self.events.finish(
+                rec, status=200, dur_s=time.monotonic() - t0,
+                reasoning=res.reasoning, text=res.content,
+                cache_n=res.cache_tokens or None,
+                prompt_n=res.prompt_tokens or None,
+                perf=perf or None)
+            self.events.emit_sync(rec)   # CLI 主线程无 running loop，不能用 emit()
+        except Exception as e:           # 观测失败不影响对话，但打印便于排查
+            print(f"[log-event] {e!r}", file=sys.stderr)
 
     def _format_perf(self, res, interrupted: bool) -> str:
         """按 max.py 的风格产出一行暗色内联统计。
@@ -881,56 +985,118 @@ class Cli:
     # ---- 3. API 日志 ----
 
     def _apilog_view(self) -> None:
+        """实时日志：追加式流，不回退修改已输出文本。
+
+        事件源 ApiEvents._logq 是 append-only 队列：每条 /v1 请求在
+        request（begin）与完成（finish）各产生一条独立记录，已入队
+        记录永不修改。CLI 增量消费、逐行向下打印（finish 记录合并
+        stream 的 reasoning/text 并携带 dur_s/cache/perf 指标），
+        屏幕滚动交给终端自身；ESC 直接返回选单，不清屏不擦写。
+        """
         print(f"\n{self.L('log_title')}")
         print(_dim(self.L("log_hint")))
-        seen = 0
-        ring = getattr(self.events, "_ring", None)
-        if ring is None:
+        events = getattr(self, "events", None)
+        if events is None:
             return
-        # 进入时回放最近 20 条
-        for rec in list(ring)[-20:]:
-            self._print_event(rec)
-            seen = max(seen, rec.get("_v", 0))
-        # 实时轮询，ESC 退出
+        cols = max(shutil.get_terminal_size().columns, 40)
         while True:
-            time.sleep(0.1)
-            for _ in range(3):
+            for rec in events.drain_log():
+                for s in self._event_lines(rec):
+                    sys.stdout.write(self._fit_line(s, cols) + "\n")
+                sys.stdout.flush()
+            for _ in range(10):
                 if _esc_pressed():
                     return
                 time.sleep(0.1)
-            for rec in list(ring):
-                if rec.get("_v", 0) > seen:
-                    self._print_event(rec)
-                    seen = rec["_v"]
 
-    def _print_event(self, rec: dict) -> None:
+    @staticmethod
+    def _fit_line(s: str, cols: int) -> str:
+        """按显示宽度截断到 cols（全角算 2 列），超宽加 … 收尾。
+
+        保证输出为物理单行：区域绘制按逻辑行数做上移重绘，
+        任何 wrap 都会让 conhost 实际行数与统计错位。
+        ANSI 转义序列（颜色码）不计列宽，整段跳过；
+        截断导致颜色序列残缺时补 \x1b[0m，防串色。
+        """
+        out: list[str] = []
+        w = 0
+        i, n = 0, len(s)
+        truncated = False
+        while i < n:
+            ch = s[i]
+            if ch == "\x1b":               # 转义序列：跳过到控制字符（字母）结束
+                j = i + 1
+                while j < n and not s[j].isalpha():
+                    j += 1
+                out.append(s[i:j + 1])
+                i = j + 1
+                continue
+            cw = _cell_width(ch)
+            if w + cw > cols:
+                truncated = True
+                break
+            out.append(ch)
+            w += cw
+            i += 1
+        if truncated:
+            out.append("…")
+            out.append("\x1b[0m")
+        return "".join(out)
+
+    def _event_lines(self, rec: dict) -> list[str]:
+        # 渲染行必须是"物理单行"：内容里任何裸 \n/\r 都会让终端实际多行。
+        def _flat(s: str) -> str:
+            return s.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+
+        lines: list[str] = []
         ts, method, path = rec.get("ts", ""), rec.get("method", "?"), rec.get("path", "?")
-        summary = str(rec.get("summary", "")).strip()
+        summary = _flat(str(rec.get("summary", ""))).strip()
         if rec.get("error"):
-            print(f"{_YELLOW}{self.L('log_err', ts=ts, method=method, path=path, err=rec['error'])}{_RESET}")
+            lines.append(f"{_YELLOW}{self.L('log_err', ts=ts, method=method, path=path, err=_flat(str(rec['error'])))}{_RESET}")
             if summary:
-                print(_dim(f"    → {summary}"))
-            return
+                lines.append(_dim(f"    → {summary}"))
+            return lines
         if rec.get("status") is None:
             line = self.L("log_pending", ts=ts, method=method, path=path)
             if summary:
                 line += _dim(f"  → {summary}")   # pending 时直接带摘要：知道在跑什么
-            print(_dim(line) if not summary else line)
-            return
+            lines.append(_dim(line) if not summary else line)
+            return lines
         line = self.L("log_line", ts=ts, method=method, path=path,
                       status=rec.get("status"), dur=rec.get("dur_s", 0))
         if rec.get("status", 500) >= 400:
-            print(f"{_YELLOW}{line}{_RESET}")
+            lines.append(f"{_YELLOW}{line}{_RESET}")
         else:
-            print(line)
-        body = summary or str(rec.get("body", "")).strip()
+            lines.append(line)
+        body = _flat(str(rec.get("body", ""))).strip()
         if body:
-            print(_dim(f"    → {body[:100]}"))
-        text = str(rec.get("text", "")).strip()
+            lines.append(_dim(f"    → {body[:100]}"))
+        text = _flat(str(rec.get("text", ""))).strip()
         reasoning = rec.get("reasoning", "")
         if text or reasoning:
             tag = (f"r:{len(reasoning)}ch " if reasoning else "") + text[-120:]
-            print(_dim(f"    ← {tag}"))
+            lines.append(_dim(f"    ← {tag}"))
+        # 缓存命中数据（从响应 footer/usage 提取；同一请求完成后在此原地出现）
+        cn, pn = rec.get("cache_n"), rec.get("prompt_n")
+        if cn is not None and pn:
+            pct = 100.0 * cn / pn
+            lines.append(_dim("    " + self.L("log_cache",
+                                              c=f"{cn:,}", t=f"{pn:,}", pct=f"{pct:.1f}%")))
+        # 性能指标（finish 携带）：TTFT / PP 速率 / TG 速率
+        perf = rec.get("perf") or {}
+        extra = []
+        tt = perf.get("ttft_s")
+        if isinstance(tt, (int, float)) and not isinstance(tt, bool):
+            extra.append(f"TTFT {tt:.1f}s")
+        pp = perf.get("pp_tps")
+        if isinstance(pp, (int, float)) and not isinstance(pp, bool):
+            extra.append(f"PP {pp:.0f} t/s")
+        tg = perf.get("tg_tps")
+        if isinstance(tg, (int, float)) and not isinstance(tg, bool):
+            extra.append(f"TG {tg:.0f} t/s")
+        if extra:
+            lines.append(_dim("    · " + " · ".join(extra)))
+        return lines
 
     # ================= 辅助 =================
 

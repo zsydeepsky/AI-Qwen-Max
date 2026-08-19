@@ -13,7 +13,11 @@ import time
 from pathlib import Path
 from typing import Any
 
-_MSG_FIELDS = ("role", "content", "reasoning_content", "tool_calls", "name", "tool_call_id")
+# 消息字段白名单：除对话结构外，还持久化 assistant 回复的元数据
+# （created_at 发起时间 / model 模型 / perf 性能 / cache 缓存命中），
+# /chat/get 原样带回，Web 端据此渲染性能行与命中信息。
+_MSG_FIELDS = ("role", "content", "reasoning_content", "tool_calls", "name", "tool_call_id",
+               "created_at", "model", "perf", "cache")
 
 
 def normalize_messages(msgs: list[dict]) -> list[dict]:

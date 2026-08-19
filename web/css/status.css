@@ -1,0 +1,107 @@
+/* ===== 运行状态页 ===== */
+body {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.status-page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.sp-ready-dot {
+  font-size: 14px;
+}
+
+.sp-auto {
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sp-auto input {
+  accent-color: var(--accent);
+}
+
+/* 卡片网格 */
+.status-grid {
+  max-width: 960px;
+  width: 100%;
+  margin: 20px auto;
+  padding: 0 20px;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.status-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.status-card h3 {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sp-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+  border-bottom: 1px dashed var(--border);
+  font-size: 13px;
+}
+
+.sp-row:last-child { border-bottom: none; }
+
+.sp-k {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.sp-v {
+  text-align: right;
+  word-break: break-all;
+  font-weight: 500;
+}
+
+/* 上下文占用进度条 */
+.ctx-bar {
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+  margin: 6px 0 2px;
+}
+
+.ctx-bar .fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+.status-error {
+  max-width: 600px;
+  margin: 40px auto;
+  padding: 20px;
+  text-align: center;
+  color: var(--err-fg);
+  font-size: 14px;
+}
