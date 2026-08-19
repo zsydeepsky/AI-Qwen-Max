@@ -45,8 +45,8 @@ web 界面 / CLI ──┐
                      ├─► ai_qwen_max（FastAPI :8080）──► llama-server（动态端口子进程）
 外部 OpenAI 客户端 ──┘        会话管理/反代/观测              │
                                                              ▼
-                                                  vendor/llama.cpp（qwenmax 分支）
-                                                  Strix Halo 定制引擎（submodule）
+                                                  vendor/llama.cpp（ryzen-uma-vulkan 分支）
+                                                  Ryzen-UMA-Vulkan-llama 引擎（submodule）
 ```
 
 ```
@@ -79,7 +79,7 @@ web 界面 / CLI ──┐
 - 上游 [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
 - 相关项目 [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp)
 
-在 `qwenmax` 分支上叠加本项目的定制补丁（保留完整上游历史，便于跟进上游更新）。全部代码遵循 MIT License。
+在 `ryzen-uma-vulkan` 分支上构建本项目的产品层（SSD 缓存 / 生成段 checkpoint / retokenize / qwen3_coder 容错等以 `patches/qwenmax-server-layer.patch` 在构建时叠加；引擎仓库本身只含 Ryzen/UMA/Vulkan 平台优化，可独立发行）。保留完整上游历史，便于跟进上游更新。全部代码遵循 MIT License。
 
 ### 同步上游更新
 

@@ -45,8 +45,8 @@ web UI / CLI ─────────┐
                       ├─► ai_qwen_max (FastAPI :8080) ──► llama-server (dynamic-port subprocess)
 external OpenAI clients ──┘  session mgmt / proxy / observability     │
                                                                        ▼
-                                                           vendor/llama.cpp (qwenmax branch)
-                                                           Strix Halo tuned engine (submodule)
+                                                           vendor/llama.cpp (ryzen-uma-vulkan branch)
+                                                           Ryzen-UMA-Vulkan-llama engine (submodule)
 ```
 
 ```
@@ -79,7 +79,7 @@ The inference engine [vendor/llama.cpp](vendor/llama.cpp) is a git submodule, ba
 - Upstream [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
 - Related project [Nathanw1014/strix-halo-llamacpp](https://github.com/Nathanw1014/strix-halo-llamacpp)
 
-Our custom patches live on the `qwenmax` branch (full upstream history preserved, so following upstream updates stays easy). All code is MIT licensed.
+The product layer is built on the `ryzen-uma-vulkan` branch (SSD cache / generation-segment checkpoints / retokenize / qwen3_coder tolerance etc. applied at build time via `patches/qwenmax-server-layer.patch`; the engine repo itself only carries Ryzen/UMA/Vulkan platform tuning and is distributable standalone). Full upstream history preserved, so following upstream updates stays easy. All code is MIT licensed.
 
 ### Syncing upstream updates
 
