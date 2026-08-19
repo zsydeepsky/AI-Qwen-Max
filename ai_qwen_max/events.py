@@ -70,6 +70,7 @@ class ApiEvents:
                error: str | None = None, reasoning: str | None = None,
                text: str | None = None,
                cache_n: int | None = None, prompt_n: int | None = None,
+               cache_layer: str | None = None,
                perf: dict | None = None) -> dict:
         out = dict(rec)
         if status is not None:
@@ -86,6 +87,8 @@ class ApiEvents:
             out["cache_n"] = cache_n
         if prompt_n is not None:
             out["prompt_n"] = prompt_n
+        if cache_layer:
+            out["cache_layer"] = cache_layer
         if perf:
             out["perf"] = perf
         return out

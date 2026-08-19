@@ -21,6 +21,7 @@ class GenResult:
     __slots__ = (
         "content", "reasoning",
         "prompt_tokens", "cache_tokens", "completion_tokens",
+        "cache_layer",                    # 命中池: "ram"|"ssd"|"snapshot"|None
         "ttft_s",                         # first reasoning/content delta 出现时间
         "prefill_s", "decode_s",          # PP / TG 分段耗时（基于 usage.timings 时覆盖）
         "prefill_tps", "decode_tps",      # tok/s
@@ -35,6 +36,7 @@ class GenResult:
         self.prompt_tokens = 0
         self.cache_tokens = 0
         self.completion_tokens = 0
+        self.cache_layer: str | None = None
         self.ttft_s: float | None = None
         self.prefill_s: float | None = None
         self.decode_s: float | None = None
@@ -388,6 +390,12 @@ def _apply_footer(res: GenResult, footer: dict) -> None:
         cached = details_cached or int(usage.get("cache_tokens") or 0)
         if cached:
             res.cache_tokens = min(cached, res.prompt_tokens)
+        # QwenMax 引擎扩展：prompt_tokens_details.cache_layer = "ram"|"ssd"|"snapshot"
+        # （旧引擎无此字段 → 保持 None，显示层回退推断）
+        if isinstance(usage.get("prompt_tokens_details"), dict):
+            layer = usage["prompt_tokens_details"].get("cache_layer")
+            if layer in ("ram", "ssd", "snapshot"):
+                res.cache_layer = layer
     # 数据层兜底：cache 不可能超过请求总 token 数
     if res.cache_tokens > res.prompt_tokens:
         res.cache_tokens = res.prompt_tokens

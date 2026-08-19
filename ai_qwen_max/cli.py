@@ -176,6 +176,34 @@ def _flush_input_buffer() -> None:
         pass
 
 
+def _console_dc3_input(enabled: bool) -> None:
+    """Windows 控制台 Ctrl+S 输入开关。
+
+    conhost 在 ENABLE_PROCESSED_INPUT(0x1) 下把 Ctrl+S 当作 XOFF 流控制吞掉，
+    msvcrt 永远读不到 → snapshot 提示"无响应"。临时清除该位后 DC3(0x13) 作为
+    普通字符进入输入缓冲，_apilog_key 才能读到。仅在 API 日志页期间生效，
+    退出恢复原模式（期间 Ctrl+C 以 0x03 字符出现，日志页不依赖 SIGINT）。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+        if not h or h == -1:
+            return
+        mode = wintypes.DWORD()
+        if not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            return
+        if enabled:
+            k32.SetConsoleMode(h, mode.value & ~0x1)
+        else:
+            k32.SetConsoleMode(h, mode.value | 0x1)
+    except Exception:
+        pass
+
+
 def _set_title(text: str) -> None:
     if sys.platform == "win32":
         import ctypes
@@ -957,6 +985,7 @@ class Cli:
                 reasoning=res.reasoning, text=res.content,
                 cache_n=res.cache_tokens or None,
                 prompt_n=res.prompt_tokens or None,
+                cache_layer=res.cache_layer,
                 perf=perf or None)
             self.events.emit_sync(rec)   # CLI 主线程无 running loop，不能用 emit()
         except Exception as e:           # 观测失败不影响对话，但打印便于排查
@@ -1044,6 +1073,13 @@ class Cli:
         if events is None:
             return
         cols = max(shutil.get_terminal_size().columns, 40)
+        _console_dc3_input(True)   # Ctrl+S 不被 conhost 当作 XOFF 吞掉，msvcrt 才能读到
+        try:
+            self._apilog_pump(events, cols)
+        finally:
+            _console_dc3_input(False)
+
+    def _apilog_pump(self, events, cols: int) -> None:
         while True:
             for rec in events.drain_log():
                 for s in self._event_lines(rec):
@@ -1168,8 +1204,10 @@ class Cli:
         cn, pn = rec.get("cache_n"), rec.get("prompt_n")
         if cn is not None and pn:
             pct = 100.0 * cn / pn
+            layer = {"ram": "RAM", "ssd": "SSD", "snapshot": "snapshot"}.get(rec.get("cache_layer"))
+            suffix = f" · {layer}" if layer else ""
             lines.append(_dim("    " + self.L("log_cache",
-                                              c=f"{cn:,}", t=f"{pn:,}", pct=f"{pct:.1f}%")))
+                                              c=f"{cn:,}", t=f"{pn:,}", pct=f"{pct:.1f}%") + suffix))
         # 性能指标（finish 携带）：TTFT / PP 速率 / TG 速率
         perf = rec.get("perf") or {}
         extra = []

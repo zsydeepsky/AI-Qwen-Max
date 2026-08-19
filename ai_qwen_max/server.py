@@ -333,19 +333,19 @@ def create_app(actx: AppCtx) -> FastAPI:
             if wants_stream:
                 return await _stream_proxy(actx, upstream, rec, conv_id, t0)
             r = await actx.aclient.send(upstream)
-            cache_n = prompt_n = None
+            cache_n = prompt_n = cache_layer = None
             perf: dict | None = None
             if path == "chat/completions" and r.status_code == 200:
                 try:
                     j = r.json()
-                    cache_n, prompt_n = _cache_numbers(j)
+                    cache_n, prompt_n, cache_layer = _cache_numbers(j)
                     perf = _perf_from(t0, None, j.get("timings") or {})
                 except ValueError:
                     pass
             actx.events.emit(actx.events.finish(rec, status=r.status_code,
                                                 dur_s=time.monotonic() - t0,
                                                 cache_n=cache_n, prompt_n=prompt_n,
-                                                perf=perf))
+                                                cache_layer=cache_layer, perf=perf))
             if conv_id and path == "chat/completions" and r.status_code == 200:
                 _persist_completion(actx, conv_id, body, r.content)
             content = (_models_body(r.content)
@@ -408,7 +408,7 @@ def create_app(actx: AppCtx) -> FastAPI:
                 if buffer:
                     _drain(buffer + b"\n")
                 await resp.aclose()
-                cache_n, prompt_n = _cache_numbers(footer) if footer else (None, None)
+                cache_n, prompt_n, cache_layer = _cache_numbers(footer) if footer else (None, None, None)
                 timings = (footer or {}).get("timings") or {}
                 perf = _perf_from(t0, first_at, timings)
                 if perf:
@@ -416,7 +416,8 @@ def create_app(actx: AppCtx) -> FastAPI:
                 actx.events.emit(actx.events.finish(
                     rec, status=resp.status_code, dur_s=time.monotonic() - t0,
                     reasoning=reasoning, text=text,
-                    cache_n=cache_n, prompt_n=prompt_n, perf=perf))
+                    cache_n=cache_n, prompt_n=prompt_n, cache_layer=cache_layer,
+                    perf=perf))
                 if conv_id:
                     assistant: dict[str, Any] = {"role": "assistant", "content": text}
                     if reasoning:
@@ -442,7 +443,7 @@ def create_app(actx: AppCtx) -> FastAPI:
             assistant: dict[str, Any] = {"role": "assistant", "content": msg.get("content") or ""}
             if msg.get("reasoning_content"):
                 assistant["reasoning_content"] = msg["reasoning_content"]
-            cache_n, prompt_n = _cache_numbers(resp)
+            cache_n, prompt_n, _ = _cache_numbers(resp)
             perf = _perf_from(0.0, None, resp.get("timings") or {})
             perf.pop("dur_s", None)   # 非流式无端到端计时
             assistant.update(_assistant_meta(actx, perf, cache_n, prompt_n))
@@ -723,20 +724,25 @@ def _assistant_meta(actx: AppCtx, perf: dict | None, cache_n: int | None,
     return meta
 
 
-def _cache_numbers(obj: dict) -> tuple[int, int]:
-    """从响应对象（非流式响应 / 流式 footer）提取 (cached_tokens, total_prompt_tokens)。
+def _cache_numbers(obj: dict) -> tuple[int, int, str | None]:
+    """从响应对象（非流式响应 / 流式 footer）提取 (cached_tokens, total_prompt_tokens, cache_layer)。
 
     语义：从 KV cache 恢复的 token 数 / 请求总 token 数。
     cached 优先取规范字段 usage.prompt_tokens_details.cached_tokens（永远 <= total），
     缺失时 fallback timings.cache_n；total = usage.prompt_tokens 或 prompt_n + cache_n。
+    cache_layer = prompt_tokens_details.cache_layer（引擎扩展："ram"/"ssd"/"snapshot"，缺失 None）。
     """
     usage = obj.get("usage") or {}
     timings = obj.get("timings") or {}
     total = int(usage.get("prompt_tokens") or 0)
     cached = 0
+    layer: str | None = None
     ptd = usage.get("prompt_tokens_details")
     if isinstance(ptd, dict):
         cached = int(ptd.get("cached_tokens") or 0)
+        l = ptd.get("cache_layer")
+        if l in ("ram", "ssd", "snapshot"):
+            layer = l
     if not cached:
         cached = int(usage.get("cache_tokens") or 0)
     pn = int(timings.get("prompt_n") or 0)
@@ -745,4 +751,4 @@ def _cache_numbers(obj: dict) -> tuple[int, int]:
         total = pn + cn
     if not cached and cn:
         cached = cn
-    return min(cached, total), total
+    return min(cached, total), total, layer
