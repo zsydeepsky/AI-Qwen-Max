@@ -28,15 +28,13 @@
 - `retokenize_with_cache`：文本级 LCP（UTF-8 边界回退，<256 字节放弃）+ 共享前缀缓存 token + 尾部重 tokenize；**detokenize 往返校验**失败则保留原 tokens。候选池 = 活跃 slots + RAM states（≤64），SSD 仅冷启动参与。治愈计数进 `/cache/stats`。
 - 配套：`server_slot::n_decoded_ckpt_last`、`create_checkpoint` identical-跳过、restore 时 `id_task` 归属标记（防 min-step 规则反复重拍 ~150MiB 状态）。
 
-## C. UMA / Vulkan 性能定制
+## C. UMA / Vulkan 性能定制（引擎层，已迁至引擎仓库）
 
-**文件**：`ggml/src/ggml-vulkan/ggml-vulkan.cpp`、`src/llama-graph.cpp`
+**文件**：`ggml/src/ggml-vulkan/ggml-vulkan.cpp`、`src/llama-graph.cpp`、`ggml/src/ggml-alloc.c`
 
-- **reads_clean 快路径**：`vk_device_struct.reads_clean`（atomic）+ `vk_command_pool::owner_device`；UMA 读在无在途提交时跳过 per-tensor barrier+submit+fence，直接 memcpy。
-- **memtypes**：`ggml_vk_find_memory_properties/create_buffer` 加 `exclude_flags`；`prefer_host_memory` 默认强制 true（HostCached GTT 三级链），修复 AMD Windows WC 映射读回 ~100MB/s。`GGML_VK_PREFER_HOST_MEMORY=0` 回退。
-- **f16acc**：`llama-graph.cpp build_attn_mha`，`RYZENUMA_FA_F16ACC` env 跳过上游强制 F32 累加（prefill +9%）。
-- **op stats**：`build_graph` 前后 enqueue wall 累计，每 10s stderr 直方图。
-- **A/B 开关**：`GGML_VK_AMD_L_TILES`（l-tile）、`GGML_VK_GDN_CPU`；一次性 dump：memtypes / FA path / GDN 维度。
+> reads_clean 快路径、HostCached GTT、F16ACC、op stats、A/B 开关（V1-V10）与 ggml-alloc 零尺寸 view 修复（C05）均属**引擎仓库平台层**（独立于本 patch 分发行），详见
+> [Ryzen-UMA-Vulkan-llama / CORE_MODIFICATIONS.md](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama/blob/ryzen-uma-vulkan/CORE_MODIFICATIONS.md)。
+> 引擎升级（rebase）时由引擎仓库按 V1-V10 逐项核对，本 patch 不包含这些改动。
 
 ## D. /max/shutdown 端点
 
@@ -50,13 +48,15 @@
 |---|---|
 | `has_mtmd` 语义：模型级能力 ≠ 本 prompt 含媒体，~12 处守卫改 `find_next_media_chunk(0).first == nullptr` | server-common/task/context |
 | prompt-cache load 恢复 slot.prompt.tokens 后 `has_mtmd` 须按 mctx 恢复 | server-context.cpp |
-| 零尺寸 view 不触发 buffer flush → NULL data crash | ggml-alloc.c |
 | qwen3_coder 工具调用解析：`</parameter>` 前缺换行容错 + `tool_choice=REQUIRED` 语法强制 | common/chat.cpp |
 | 辅助请求 LCP 抢占：相似度接管加 `cache_prompt` 条件 + LRU 接管 `empty_base` | server-context.cpp |
 | `remove_contained` 迭代器失效 | server-task.cpp |
-| Web UI 标题生成请求 `cache_prompt: false` | tools/ui chat.service.ts |
+
+> 注：ggml-alloc 零尺寸 view 修复（C05）属引擎层，见 [引擎仓库 CORE_MODIFICATIONS.md](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama/blob/ryzen-uma-vulkan/CORE_MODIFICATIONS.md)；Web UI 标题 `cache_prompt: false`（C11）已于 2026-08-19 删除。
 
 ## F. 已剥离（历史尝试，勿复入）
+
+> TurboQuant 与临时诊断均属**引擎层历史**，记录见引擎仓库；此处仅保留警示，勿复入。
 
 - **TurboQuant TQ4**（GGML_TYPE_TURBO4_0 / GGML_OP_TURBO_WHT / turbo shaders / codec / FA 融合）：行为级降智已否决，代码已从分支中完全移除（GGML_TYPE_COUNT=43、GGML_OP_COUNT=101 与上游一致）。
 - 各类 `_ReturnAddress`/fprintf 临时诊断。

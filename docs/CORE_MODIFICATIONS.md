@@ -1,28 +1,15 @@
-# 核心修改技术文档（Strix Halo 平台特化）
+# 产品层核心修改技术文档（AI-Qwen-Max）
 
-> 本文档阐述本工程在 llama.cpp 上做过的、**只在 AMD Ryzen AI Max（Strix Halo / gfx1151）统一内存平台上成立**的工程改变：动机、原理、核心算法摘抄，以及未来 rebase 到新上游后重新实现这些功能所需的全部要点。
+> 本文档阐述 **AI-Qwen-Max 产品层定制**（`patches/qwenmax-server-layer.patch` 叠加在引擎上的 server/chat 层改动）的技术深度版：动机、原理、核心算法摘抄，以及未来引擎升级后重新实现所需的全部要点。
 >
 > 定位（与其它文档的分工）：
-> - [UPSTREAM.md](UPSTREAM.md) —— 上游协作策略与逐项台账（哪项该上提 / 该删 / 该跟踪）
+> - [UPSTREAM.md](UPSTREAM.md) —— 产品层上游协作策略与逐项台账（哪项该上提 / 该删 / 该跟踪）
 > - [ENGINE_PATCHES.md](ENGINE_PATCHES.md) —— 补丁清单与构建注意事项（A-F 补丁）
 > - **本文档** —— 每个修改"为什么这么写、只在这个平台成立、代码长什么样"的技术深度版
 >
-> 代码摘抄来源：`build/patch-c1be87f.diff`（基础定制层）、`build/patch-a08de81.diff`（reasoning-budget 软注入）。摘抄保留原始英文注释，说明文字为中文。
-
----
-
-## 0. 平台背景：为什么这些改动只在 Strix Halo 成立
-
-Strix Halo（gfx1151）的本质特征，决定了本工程所有定制的合理性边界：
-
-| 平台特征 | 后果 | 对本工程的意义 |
-|---|---|---|
-| **统一内存（UMA）**：显存与系统内存同体，GPU 直接访问整个 RAM | 内存既装模型/KV，又装缓存；不存在独立显存池 | RAM 是**稀缺共享资源** → 值得把冷数据挪去 SSD（C01）；值得为命中率做复杂治愈（C02） |
-| **内存极充裕**（Ryzen AI Max 395+ 通常 128GB+） | 可以挥霍内存换速度 | 快照（C02）、48GB RAM 缓存不再肉痛；对 8-16GB 大众设备是"压垮推理栈"，对我们是"纯赚" |
-| **AMD Windows 驱动特性**：WC 映射读慢（~100MB/s）、barrier/fence 开销大 | 内存回读与同步是真实瓶颈 | HostCached GTT 优先、reads_clean 快路径（C04） |
-| **单机单用户场景**：无多租户、无共享显存压力 | 可以接受每请求多几十 ms 的 CPU 预处理（BPE 治愈） | 上游多用户 server 场景下这类开销会被放大到不可接受 |
-
-一句话概括：**本工程的所有定制都是"用充裕的统一内存 / 单机场景，换取推理延迟"的交易**。交易在 Strix Halo 上永远划算，在面向广大设备的上游不成立——这正是大部分改动"留本地、不上提"的根本原因。
+> **引擎层**（C04 Vulkan/UMA 优化组、C05 ggml-alloc 修复）的台帐与平台背景已迁至引擎仓库
+> [Ryzen-UMA-Vulkan-llama](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama) 的
+> [CORE_MODIFICATIONS.md](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama/blob/ryzen-uma-vulkan/CORE_MODIFICATIONS.md)（含可直接投递上游的英文 issue 素材），本文档不再重复。
 
 ---
 
@@ -188,164 +175,11 @@ if (healed.detokenize(ctx_tgt, true) != text_new) return; // 失败则保持原 
 
 ---
 
-## 3. C04 — Vulkan / UMA 优化组（gfx1151 专用）
+## 3. C04 / C05（引擎层）— 已迁至引擎仓库
 
-全部位于 `ggml/src/ggml-vulkan/ggml-vulkan.cpp` 与 `src/llama-graph.cpp`。**平台相关性最强**的改动，也最容易被上游大版本更新冲掉。
-
-> 本节按"issue 素材库"组织：3.3~3.5 的三项可上提定制，每项给出**中文要点** + **核心代码摘抄** + **可直接复制到 GitHub 的英文 issue 正文**（发 issue 时只需审一遍、补数据即可）。
-
-### 3.1 平台背景
-
-UMA 下 GPU 与 CPU 共享内存；AMD Windows 驱动对非 HostCached 的 host 映射按 write-combined 处理，**CPU 读只有 ~100MB/s**；上游每次 buffer 读都无条件做 barrier/submit/fence（~15ms/次）。批量状态读（快照 ~100 次 × 150MiB）因此被放大到 ~1.5s，纯 memcpy 只需 ~30ms。
-
-### 3.2 完整定制清单 V1-V10（rebase 重挂清单）
-
-| # | 位置 | 定制 | 性质 |
-|---|---|---|---|
-| V1 | `vk_command_pool` | `owner_device` 回指指针 | 支撑 V2 |
-| V2 | `vk_device_struct` + `submit`/`wait_for_fence`/`write_2d`/`read_2d` | `reads_clean` 快路径 | 性能 |
-| V3/V4 | `find_memory_properties`/`create_buffer` | `exclude_flags` 参数 | 支撑 V5 |
-| V5 | `create_buffer_device` | HostCached GTT 优先 | 性能 |
-| V6 | `get_fa_tuning_params` | FA 路径 dump | 诊断 |
-| V7 | `get_device` | 强制 prefer_host_memory + memtype dump + `GGML_VK_AMD_L_TILES` | 性能+诊断+A/B |
-| V8 | `build_graph` | op 计时直方图 | 诊断 |
-| V9 | `device_supports_op` | GDN 诊断 + `GGML_VK_GDN_CPU` | 诊断+A/B |
-| V10 | `build_attn_mha` | `QWENMAX_FA_F16ACC` | 性能 |
-
-### 3.3 Issue 素材一：V2 reads_clean 快路径（官方候选）
-
-**中文要点：**
-- 现象：UMA 上每次 buffer 读都走 barrier+submit+fence，批量状态读被放大（150MiB 快照 ~1.5s）
-- 根因：上游无"整批只同步一次"机制，每读必同步
-- 方案：`reads_clean` 标志——`submit` 置 false，`waitForFences` 通过后置 true；为 true 时 host 读跳过同步直接 memcpy
-- 数据：快照 1.5s → ~30ms，decode/prefill 吞吐不变
-- 上游切入点：需去"单队列串行"假设（通用化需 reader-count/epoch 方案）
-
-**核心代码摘抄：**
-
-```cpp
-// vk_device_struct 新增字段
-std::atomic<bool> reads_clean { false };
-
-// ggml_vk_submit：任何排队 GPU 工作使快路径失效
-if (ctx->p && ctx->p->owner_device) {
-    ctx->p->owner_device->reads_clean.store(false, std::memory_order_release);
-}
-
-// ggml_vk_wait_for_fence / ggml_vk_buffer_write_2d（fence-ack 后）：
-ctx->device->reads_clean.store(true, std::memory_order_release);
-
-// ggml_vk_buffer_read_2d UMA 分支：仅未同步过才走完整同步，否则直读
-if (!src->device->reads_clean.load(std::memory_order_acquire)) {
-    // barrier + ggml_vk_submit + waitForFences + cleanup
-    src->device->reads_clean.store(true, std::memory_order_release);
-}
-memcpy(dst, (const uint8_t *) src->ptr + offset, width * height);
-```
-
-**英文 issue 正文（可直接复制）：**
-
-```markdown
-### Problem
-On UMA (unified-memory) APUs, `ggml_vk_buffer_read_2d` and the state-copy
-paths issue a full barrier + submit + waitForFences round-trip for every read,
-even when the GPU has no outstanding work. Back-to-back state reads (e.g.
-snapshotting ~100 tensors of a 150 MiB hybrid-state checkpoint) pay ~15 ms of
-sync overhead per read -> ~1.5 s per snapshot vs ~30 ms of pure memcpy.
-
-### Proposal
-Track a per-device `reads_clean` flag: set false on every `ggml_vk_submit`,
-set true after the matching waitForFences. When true, host-visible UMA reads
-can skip the barrier/submit/fence and go straight to memcpy - one sync per
-batch instead of one per tensor.
-
-### Caveat for upstream
-The current implementation assumes submissions and state reads are externally
-serialized (single queue thread, true for llama-server). A general version
-needs a reader-count/epoch scheme to stay safe with concurrent queues.
-
-### Data
-Strix Halo (gfx1151, UMA): 150 MiB hybrid-state checkpoint readback
-1.5 s -> ~30 ms with the fast path; decode/prefill throughput unchanged.
-```
-
-### 3.4 Issue 素材二：V5/V7 HostCached GTT 优先（strix-halo 生态候选）
-
-**中文要点：**
-- 现象：AMD Windows 上 `prefer_host_memory` 分配到的 HostVisible 内存被驱动映射为 write-combined（carveout 与无 HOST_CACHED 的 GTT 都是），CPU 读 ~100MB/s
-- 根因：只有 `HostVisible|HostCoherent|HostCached` 类型（0xe）是 cacheable 映射；上游分配逻辑不选它
-- 方案：`create_buffer_device` 首选 HostCached（新增 `exclude_flags` 参数，首轮排除 DeviceLocal，逐级回退）；`get_device` 默认 `prefer_host_memory=true`（env 可 opt-out）
-- 关键：**与上游 8a8fee7 配套**——8a8fee7 假设 HostCached 才走直读路径，本改动让分配端真正提供 HostCached
-- 上提对象：strix-halo 生态（影响所有设备默认分配行为，官方阻力大）
-
-**核心代码摘抄：**
-
-```cpp
-// ggml_vk_create_buffer_device, prefer_host_memory 分支
-buf = ggml_vk_create_buffer(device, size,
-    { eHostVisible | eHostCoherent | eHostCached,   // 首选：HostCached（cacheable）
-      eHostVisible | eHostCoherent,                 // 回退：原行为
-      eDeviceLocal },                               // 回退：设备本地
-    nullptr, vk::MemoryPropertyFlagBits::eDeviceLocal); // exclude：首轮跳过 DL
-
-// ggml_vk_get_device：默认强制 GTT（cacheable sysmem）
-device->prefer_host_memory = true;
-if (GGML_VK_PREFER_HOST_MEMORY && strcmp(GGML_VK_PREFER_HOST_MEMORY, "0") == 0) {
-    device->prefer_host_memory = false;            // A/B opt-out
-}
-```
-
-**英文 issue 正文（可直接复制）：**
-
-```markdown
-### Problem
-On AMD Windows, the `prefer_host_memory` allocation path picks
-`HostVisible|HostCoherent` memory that the driver maps write-combined (both
-the carveout type and the GTT type without HOST_CACHED). CPU reads from WC
-mappings run at ~100 MB/s, so bulk readback (checkpoints, prompt cache) is
-~10x slower than it should be. Only the `HostVisible|HostCoherent|HostCached`
-type is mapped cacheable.
-
-### Proposal
-1. In `ggml_vk_create_buffer_device`, prefer the HostCached-capable type
-   first, excluding DeviceLocal on the first attempt and falling back
-   progressively (an `exclude_flags` parameter on `ggml_vk_create_buffer`).
-2. Default `prefer_host_memory = true` on this device class, keeping the env
-   opt-out for A/B.
-
-This complements "take the copy path for bulk UMA reads from uncached
-mappings" (8a8fee7): that commit assumes a HostCached mapping for the direct
-read path; this makes the allocator actually provide one.
-```
-
-### 3.5 Issue 素材三：V10 F16ACC（A/B 候选，非紧迫）
-
-**中文要点：** `build_attn_mha` 无条件强制 FP32 attention 累加；Vulkan coopmat1 的 fp16-acc MMA 更快，本工程 env 可跳过（prefill +9%）。质量需按模型 A/B，属"提议而非缺陷报告"，优先级低。
-
-**核心代码摘抄：**
-
-```cpp
-// build_attn_mha
-if (!getenv("RYZENUMA_FA_F16ACC")) {
-    ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-}
-```
-
-**英文 issue 正文（可直接复制）：**
-
-```markdown
-### Proposal
-`build_attn_mha` unconditionally forces GGML_PREC_F32 accumulation for flash
-attention. On Vulkan coopmat1 the fp16-acc MMA path is notably faster. Add an
-env opt-out to test fp16 accumulation; quality needs A/B per model.
-```
-
-### 3.6 审计结论（2026-08-19 对照 origin/strix-halo-vulkan @ 0b0f35d0 + origin/master）
-
-- **10 处全部独有，上游（两层面）均未吸收**——无同名标志、无同名结构。
-- **与上游动机互补而非重复**：上游 `8a8fee7`（UMA copy bugfix，已并入基线）走"按内存类型分流"——HostCached 映射直读、非 HostCached 大块走 device copy path。上游**假设** HostCached 才直读但不负责强制分配；V5/V7 强制分配走 HostCached，上游的直读路径才真正生效。二者配套，缺一不可。
-- **rebase 风险最高项**：上游 Vulkan 后端持续大改（`read_2d_async`、DSV4 系列优化、多次 merge）。已核对挂载点：同步 `read_2d`/`submit`/`wait_for_fence`/`create_buffer_device`/`build_attn_mha` 签名均未变，V1-V10 可重新落点；唯 `read_2d` UMA 分支新增 `host_cached` 判断 + `<=64KB` 小读直读，V2 快路径需并入新结构（在 host_cached 分支内生效，语义更精确）。
-- **上提路径**：V2 → 官方 issue（3.3 素材）；V5/V7 → strix-halo 生态 issue（3.4 素材，与 8a8fee7 作者交流最有效）；V10 → 低优先级 A/B 提议（3.5）；V6/V8/V9 诊断类永远本地。
+> **C04**（Vulkan / UMA 优化组 V1-V10：reads_clean 快路径、HostCached GTT、F16ACC 等，含英文 issue 素材）与 **C05**（ggml-alloc 零尺寸 view 修复）属于引擎仓库平台层，其技术详解与 rebase 重挂清单见
+> [Ryzen-UMA-Vulkan-llama / CORE_MODIFICATIONS.md](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama/blob/ryzen-uma-vulkan/CORE_MODIFICATIONS.md)。
+> 产品层不涉及这两项，引擎升级时引擎仓库自行核对。
 
 ---
 
@@ -409,7 +243,7 @@ case REASONING_BUDGET_SOFT_INJECT:
 当上游大版本更新导致必须 rebase / 重建本工程时，按此顺序：
 
 1. **先重建缓存支柱**（收益最大、依赖最深）：按 §1 重建 SSD 层（迁新文件 + 4 钩子）、按 §2.1 重建生成段 checkpoint、按 §2.2 重建 BPE 治愈。这三者相互依赖（治愈依赖缓存候选，checkpoint 依赖治愈对齐），必须成套验证。
-2. **再恢复平台性能**：按 §3 核对 Vulkan 项——先查上游是否已吸收（直接删），未吸收的按 env 开关方式重建。
+2. **平台性能**：引擎层（C04 Vulkan / C05 ggml-alloc）由引擎仓库自行核对（见其 CORE_MODIFICATIONS.md §3 rebase 重挂清单）；本工程产品层不涉及，无需处理。
 3. **思考预算**：已完全使用上游 `--reasoning-budget` / `--reasoning-budget-message`（软注入已于 2026-08-19 删除），无需重建；注入命令在 Python 层 `THINK_NUDGE` 配置。
 4. **小项**：按 §5 表逐项过（多数是独立小改动，低风险）。
 5. **每步验证**：跑 `scripts/bench.py` 同参对比 + 缓存命中 TTFT（~84ms 基准），确认重建未破坏缓存链路。

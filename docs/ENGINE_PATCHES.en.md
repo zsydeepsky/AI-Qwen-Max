@@ -29,15 +29,13 @@ Architecture (split 2026-08-19): the engine repo is a **pure platform layer**
 - `retokenize_with_cache`: text-level LCP (UTF-8 boundary fallback, gives up beyond 256 bytes) + shared-prefix cached tokens + tail re-tokenization; **detokenize round-trip verification** — on failure the original tokens are kept. Candidate pool = active slots + RAM states (<=64); SSD joins only on cold start. Heal counters feed into `/cache/stats`.
 - Accompanying: `server_slot::n_decoded_ckpt_last`, `create_checkpoint` identical-skip, `id_task` ownership marking on restore (prevents the min-step rule from re-snapshotting a ~150MiB state repeatedly).
 
-## C. UMA / Vulkan performance customizations
+## C. UMA / Vulkan performance customizations (engine layer, moved to the engine repo)
 
-**Files**: `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `src/llama-graph.cpp`
+**Files**: `ggml/src/ggml-vulkan/ggml-vulkan.cpp`, `src/llama-graph.cpp`, `ggml/src/ggml-alloc.c`
 
-- **reads_clean fast path**: `vk_device_struct.reads_clean` (atomic) + `vk_command_pool::owner_device`; UMA reads skip the per-tensor barrier+submit+fence when no submissions are in flight — a plain memcpy.
-- **memtypes**: `ggml_vk_find_memory_properties/create_buffer` gained `exclude_flags`; `prefer_host_memory` forced on by default (three-step HostCached GTT chain), fixing ~100MB/s WC readback on AMD Windows. `GGML_VK_PREFER_HOST_MEMORY=0` restores the old behavior.
-- **f16acc**: `llama-graph.cpp build_attn_mha`; the `RYZENUMA_FA_F16ACC` env skips the upstream-forced F32 accumulation (prefill +9%).
-- **op stats**: wall-time accumulation around `build_graph` enqueue; stderr histogram every 10s.
-- **A/B switches**: `GGML_VK_AMD_L_TILES` (l-tile), `GGML_VK_GDN_CPU`; one-shot dumps: memtypes / FA path / GDN dims.
+> The reads_clean fast path, HostCached GTT, F16ACC, op stats, A/B switches (V1-V10) and the ggml-alloc zero-sized-view fix (C05) all belong to the **engine repo platform layer** (shipped independently of this patch). See
+> [Ryzen-UMA-Vulkan-llama / CORE_MODIFICATIONS.md](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama/blob/ryzen-uma-vulkan/CORE_MODIFICATIONS.md).
+> The engine repo reconciles them against upstream V1-V10 on engine upgrades; this patch does not contain them.
 
 ## D. /max/shutdown endpoint
 
@@ -51,13 +49,15 @@ Architecture (split 2026-08-19): the engine repo is a **pure platform layer**
 |---|---|
 | `has_mtmd` semantics: model-level capability != this prompt containing media; ~12 guards changed to `find_next_media_chunk(0).first == nullptr` | server-common/task/context |
 | prompt-cache load must restore `has_mtmd` from mctx after restoring slot.prompt.tokens | server-context.cpp |
-| zero-sized view not triggering buffer flush -> NULL data crash | ggml-alloc.c |
 | qwen3_coder tool-call parsing: newline tolerance before `</parameter>` + `tool_choice=REQUIRED` grammar enforcement | common/chat.cpp |
 | auxiliary-request LCP preemption: similarity takeover gains a `cache_prompt` condition + LRU takeover `empty_base` | server-context.cpp |
 | `remove_contained` iterator invalidation | server-task.cpp |
-| Web UI title-generation request `cache_prompt: false` | tools/ui chat.service.ts |
+
+> Note: the ggml-alloc zero-sized-view fix (C05) belongs to the engine layer — see [engine repo CORE_MODIFICATIONS.md](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama/blob/ryzen-uma-vulkan/CORE_MODIFICATIONS.md); the Web-UI title `cache_prompt: false` (C11) was removed on 2026-08-19.
 
 ## F. Removed (historical experiments, do not reintroduce)
+
+> TurboQuant and the temporary diagnostics are **engine-layer history** (recorded in the engine repo); kept here only as a warning, do not reintroduce.
 
 - **TurboQuant TQ4** (GGML_TYPE_TURBO4_0 / GGML_OP_TURBO_WHT / turbo shaders / codec / FA fusion): behavioral quality regression, rejected; fully stripped from the branch (GGML_TYPE_COUNT=43, GGML_OP_COUNT=101 match upstream).
 - Assorted `_ReturnAddress`/fprintf temporary diagnostics.
