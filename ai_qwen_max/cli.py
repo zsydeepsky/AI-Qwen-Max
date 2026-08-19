@@ -83,12 +83,17 @@ STR = {
         "del_confirm": "确认删除「{t}」？(y/n，ESC=n) ",
         "del_done": "已删除会话「{t}」（引擎缓存按 TTL 自然过期）。",
         "del_no": "已取消。",
-        "log_title": "── API 实时日志（ESC 返回选单）──",
+        "log_title": "── API 实时日志（ESC 返回 · Ctrl+S 建 snapshot）──",
         "log_hint": "（显示前端 HTTP 服务收到的请求与 CLI 自身对话；CLI 对话直连引擎，事件在此补齐）",
         "log_pending": "[{ts}] {method} {path} …",
         "log_line": "[{ts}] {method} {path} → {status} · {dur}s",
         "log_err": "[{ts}] {method} {path} ✗ {err}",
         "log_cache": "↳ cache 命中 {c}/{t}（{pct}）",
+        "snap_no_backend": "snapshot 创建失败：引擎未就绪",
+        "snap_start": "snapshot 创建开始…",
+        "snap_done": "snapshot 保存完成：{t} tokens · {mib:.1f} MiB · {d:.1f}s",
+        "snap_fail": "snapshot 创建失败：{e}",
+        "snap_fail_http": "snapshot 创建失败：HTTP {s}",
         "err_invalid": "无效输入，重试。",
     },
     "en": {
@@ -142,6 +147,11 @@ STR = {
         "log_line": "[{ts}] {method} {path} → {status} · {dur}s",
         "log_err": "[{ts}] {method} {path} ✗ {err}",
         "log_cache": "↳ cache hit {c}/{t} ({pct})",
+        "snap_no_backend": "snapshot create failed: engine not ready",
+        "snap_start": "snapshot creation started…",
+        "snap_done": "snapshot saved: {t} tokens · {mib:.1f} MiB · {d:.1f}s",
+        "snap_fail": "snapshot create failed: {e}",
+        "snap_fail_http": "snapshot create failed: HTTP {s}",
         "err_invalid": "Invalid input, retry.",
     },
 }
@@ -335,20 +345,25 @@ def _read_key() -> str:
         return ch
 
 
-def _esc_pressed() -> bool:
-    """非阻塞探测 ESC（日志页轮询用）。"""
+def _apilog_key() -> str | None:
+    """非阻塞探测日志页按键：'esc'=ESC 返回，'ctrls'=Ctrl+S 创建 snapshot，None=无。
+
+    Windows 控制台 Ctrl+S 由 msvcrt 报为 0x13（DC3），与 ESC(0x1b) 区分。
+    """
     if sys.platform != "win32":
-        return False
+        return None
     import msvcrt
     if not msvcrt.kbhit():
-        return False
+        return None
     ch = msvcrt.getwch()
     if ch in ("\x00", "\xe0"):
         msvcrt.getwch()
-        return False
+        return None
     if ch == "\x1b":
-        return True
-    return False
+        return "esc"
+    if ch == "\x13":                       # Ctrl+S
+        return "ctrls"
+    return None
 
 
 class InterruptPoller:
@@ -1035,9 +1050,52 @@ class Cli:
                     sys.stdout.write(self._fit_line(s, cols) + "\n")
                 sys.stdout.flush()
             for _ in range(10):
-                if _esc_pressed():
+                key = _apilog_key()
+                if key == "esc":
                     return
+                if key == "ctrls":
+                    self._create_snapshot(cols)
                 time.sleep(0.1)
+
+    def _create_snapshot(self, cols: int) -> None:
+        """Ctrl+S：为当前正在处理的 KV cache 创建持久 snapshot。
+
+        POST /snapshot/create（引擎端）：把当前（或最近活跃）slot 的
+        prompt + KV 状态保存到 <ssd>/snapshots 持久条目。命中不删文件、
+        长 TTL 过期（默认 30 天，config 可调）。开始与完成都在日志中提示。
+        """
+        backend = getattr(self, "backend", None)
+        t0 = time.time()
+        if backend is None or not getattr(backend, "healthy", False):
+            self._snap_line(self.L("snap_no_backend"), cols, warn=True)
+            return
+        self._snap_line(self.L("snap_start"), cols)
+        try:
+            resp = backend.post("/snapshot/create", timeout=600)
+        except Exception as e:
+            self._snap_line(self.L("snap_fail", e=str(e)), cols, warn=True)
+            return
+        dur = time.time() - t0
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                ok = data.get("ok")
+                toks = data.get("tokens", 0)
+                nbytes = data.get("bytes", 0)
+            except ValueError:
+                ok, toks, nbytes = None, 0, 0
+            if ok:
+                self._snap_line(self.L("snap_done", t=toks, mib=nbytes / (1024.0 * 1024.0), d=dur), cols)
+            else:
+                err = data.get("error", "unknown") if isinstance(data, dict) else "unknown"
+                self._snap_line(self.L("snap_fail", e=err), cols, warn=True)
+        else:
+            self._snap_line(self.L("snap_fail_http", s=resp.status_code), cols, warn=True)
+
+    def _snap_line(self, text: str, cols: int, warn: bool = False) -> None:
+        line = f"[{time.strftime('%H:%M:%S')}] " + (f"{_YELLOW}{text}{_RESET}" if warn else text)
+        sys.stdout.write(self._fit_line(line, cols) + "\n")
+        sys.stdout.flush()
 
     @staticmethod
     def _fit_line(s: str, cols: int) -> str:

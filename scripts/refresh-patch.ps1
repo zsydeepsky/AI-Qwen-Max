@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
   重新生成产品层补丁（引擎升级后使用）
 
@@ -36,12 +36,19 @@ $files = @(
     'tools/server/ssd-prompt-cache.h'
 )
 
+# ssd-prompt-cache.* 是引擎剥离后的工作区新增文件（untracked）；git diff 默认
+# 不包含 untracked 文件，先用 intent-to-add 标记让 diff 把它作为新文件导出。
+git -C $llamaDir add -N tools/server/ssd-prompt-cache.cpp tools/server/ssd-prompt-cache.h
+
 git -C $llamaDir diff origin/strix-halo-vulkan -- $files > $patchPath
 if ($LASTEXITCODE -ne 0) { throw 'git diff 失败（检查 origin/strix-halo-vulkan 引用是否存在）。' }
 
 # 校验：补丁应能从纯化引擎干净应用
-git -C $llamaDir checkout -q origin/strix-halo-vulkan -- $files
-git -C $llamaDir rm -q --ignore-unmatch tools/server/ssd-prompt-cache.cpp tools/server/ssd-prompt-cache.h 2>$null
+# tracked 文件恢复为 origin 版本；ssd-prompt-cache.* 在 origin 中不存在
+# （引擎剥离产品层后的工作区新增文件），物理删除后由 patch 重新创建。
+$tracked = $files | Where-Object { $_ -notmatch '^tools/server/ssd-prompt-cache' }
+git -C $llamaDir checkout -q origin/strix-halo-vulkan -- $tracked
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $llamaDir 'tools\server\ssd-prompt-cache.cpp'), (Join-Path $llamaDir 'tools\server\ssd-prompt-cache.h')
 git -C $llamaDir apply --check $patchPath
 if ($LASTEXITCODE -ne 0) {
     git -C $llamaDir checkout -q HEAD -- .
@@ -49,5 +56,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 # 恢复工作区（补丁已应用）
 git -C $llamaDir apply $patchPath
+# 清理 intent-to-add 残留，恢复 untracked 工作区状态（与引擎剥离后的常态一致）
+git -C $llamaDir reset -q -- tools/server/ssd-prompt-cache.cpp tools/server/ssd-prompt-cache.h
 Write-Host "补丁已更新：$patchPath"
 Write-Host "（$((Get-Content $patchPath | Measure-Object -Line).Lines) 行）"

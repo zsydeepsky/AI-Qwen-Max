@@ -104,6 +104,7 @@ class Backend:
             "--cache-ssd", str(cfg["cache_ssd_mib"]),
             "--cache-ssd-path", str(self.root / "cache-ssd"),
             "--cache-ssd-ttl-hours", str(cfg["cache_ssd_ttl_hours"]),
+            "--cache-snapshot-ttl-hours", str(cfg["cache_snapshot_ttl_hours"]),
             "--verbosity", str(cfg["verbosity"]),
         ]
         # 思考预算：effort 档 × min(模型最大输出, ctx) 作为引擎级默认，覆盖所有客户端——

@@ -26,6 +26,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cache_ram_mib": 49152,      # RAM prompt-cache 池
     "cache_ssd_mib": 65536,      # SSD prompt-cache 池（0=关 -1=无限）
     "cache_ssd_ttl_hours": 24,   # SSD 条目存活时间
+    "cache_snapshot_ttl_hours": 720,  # snapshot 条目存活时间（小时；默认 30 天）
     "avail_mem_min_gb": 4,       # 系统可用内存低于此值不做主动驱逐判断
     "cache_ram_target_gb": 16,   # RAM 池软上限（驱逐参考）
     "reasoning_effort": "low",   # off | low | medium | xHigh（思考预算百分比见 effort_think_pct）
