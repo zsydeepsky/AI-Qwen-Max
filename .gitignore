@@ -13,7 +13,10 @@ dist/
 
 # 运行时实例目录（会话/缓存/日志，均属用户数据）
 .max/
+# SSD 缓存：api-cache 条目 + snapshot 持久条目（<ssd>/snapshots）
+# 默认位于 .max/cache-ssd/（随 .max/ 忽略）；此处保留为仓库根兜底
 cache-ssd/
+cache-ssd/snapshots/
 .test-max/
 
 # 模型文件（不入库）
