@@ -8,7 +8,7 @@
         │ 子进程 + HTTP:127.0.0.1:8081
         ▼
   llama-server (vendor/llama.cpp = Ryzen-UMA-Vulkan-llama 引擎 ryzen-uma-vulkan 分支
-  纯平台层 + 产品层 patch: K8V8 / SSD cache / MTP / checkpoint / retokenize)
+  纯平台层 + 产品层 patch: K8V8 / SSD cache / DFlash2 spec-decode / checkpoint / retokenize)
 """
 
 __version__ = "1.0.0"

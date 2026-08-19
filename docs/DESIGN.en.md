@@ -46,9 +46,10 @@ Between the frontend and the engine there is only HTTP (OpenAI-compatible plus a
 - Hybrid architectures (SSM+attention) roll back via checkpoints, not KV shift. Upstream only builds checkpoints during the prompt phase, so last turn's reply got fully recomputed the next turn. Custom: rolling snapshot every 256 tokens during decode (2 kept) + a final snapshot when generation ends.
 - Greedy per-token output vs whole-segment re-tokenization can disagree on BPE boundaries, defeating token-level LCP. Custom: retokenize_with_cache (text-level LCP + detokenize round-trip check); candidate pool = active slots + RAM states (SSD participates only on cold start).
 
-### 3.4 Speculative decoding: MTP (model-embedded nextn head)
-- `--spec-type draft-mtp`, only when the GGUF has `{arch}.nextn_predict_layers > 0` (auto-probed by the Python frontend; MTP-less models such as A3B are skipped automatically).
-- Rejected: standalone CPU draft models (draft-simple) and prefill row-split coordination (did not meet expectations).
+### 3.4 Speculative decoding: DFlash2 (standalone draft model, replacing MTP)
+- Previously used MTP (model-embedded nextn head, `--spec-type draft-mtp`): Qwen3.8's MTP head is tied to xHigh reasoning; changing the reasoning effort made the acceptance rate collapse, so it slowed output instead of helping — fully removed.
+- Now uses `--spec-type draft-dflash --spec-draft-model <draft.gguf>`: the draft model path comes from each model entry's `DFlash2_draft_model` field (`config.models` object list); speculative decoding is off when unset.
+- Optional tuning field (omitted by default, using engine default): `spec_n_max` draft token cap (default 3, DFlash2 cap = block size 8). `/model/load` re-reads config each time, so changes take effect on hot-swap. Note: DFlash's `--spec-draft-conf-min` is not implemented in this engine (docs only), not exposed.
 
 ### 3.5 UMA memory (the critical Strix Halo fix)
 - AMD's Windows driver maps HostVisible non-HostCached memory as write-combined: CPU reads at ~100MB/s, so an SSM checkpoint snapshot (150MiB) took 1.4s.
@@ -71,7 +72,7 @@ Between the frontend and the engine there is only HTTP (OpenAI-compatible plus a
 ai_qwen_max/
 ├── __main__.py   entry: argparse + wiring + uvicorn (background thread) + CLI foreground
 ├── config.py     Config (.max/config.json, atomic writes, defaults are the production baseline)
-├── gguf.py       GGUF header parsing (nextn layer probe, stdlib only)
+├── gguf.py       GGUF header parsing (template/multimodal/max-output probing, stdlib only)
 ├── backend.py    Backend: process lifecycle / flag assembly / readiness probing / graceful shutdown
 ├── store.py      SessionStore/Session: session persistence (atomic writes + dialogue replay + media)
 ├── events.py     ApiEvents: /api/events ring buffer + SSE delta push
@@ -101,6 +102,6 @@ Implementation notes (known pitfalls of this kind of integration, all handled he
 | TurboQuant TQ4 | ❌ | Behavioral degradation (refuses tools), decode only +2% |
 | Power profiles | ❌ | Touching the power plan gained nothing; in-process parameters suffice |
 | SSD cache lossless compression | ❌ | q8_0 residual entropy is nearly full; deflate saves only 5-6% |
-| Standalone CPU draft | ❌ | The embedded MTP head already covers it; benefit below complexity |
+| MTP embedded head (Qwen3.8) | ❌ | Tied to xHigh reasoning; changing effort collapsed the acceptance rate and slowed output; replaced by the DFlash2 standalone draft model |
 | prefill row-split coordination | ❌ | Layer assignment did not meet expectations |
 | l-tile GEMM | ⏸ | Driver-dependent; -38% on the current driver, kept off (`GGML_VK_AMD_L_TILES=0`); retest after driver updates |

@@ -11,9 +11,10 @@ from typing import Any
 
 import httpx
 
+from . import orphan
 from .config import Config
-from .gguf import chat_template, find_mmproj, model_max_output, nextn_layer_count
-from .llm import EFFORT_THINK_PCT, THINK_NUDGE
+from .gguf import chat_template, find_mmproj, model_max_output
+from .llm import EFFORT_THINK_PCT
 
 PARALLEL = 3          # slot 数：2 路 API + 1 路 CLI/Web
 READY_TIMEOUT_S = 600  # 大模型冷加载宽限
@@ -21,6 +22,33 @@ SHUTDOWN_GRACE_S = 60  # 含 uvicorn 退出钩子落盘 KV 缓存的耗时，30s
 
 # llama-server 打印实际监听地址的行（HTTP bind 在模型加载前，但此 INFO 行在加载后输出）
 _LISTEN_RE = re.compile(rb"listening on http://[^:/\s]+:(\d+)")
+
+
+def _spec_draft_config(cfg: Config, model: str) -> dict | None:
+    """返回匹配 model 的 DFlash2 投机解码配置（dict），未配置草稿返回 None。
+
+    从 config.models 对象条目读取：
+      DFlash2_draft_model  草稿模型路径（必填，文件不存在视为未配置）
+      spec_n_max           每步草稿 token 上限（clamp 到草稿 block size；None = 引擎默认 3）
+    路径比较用纯字符串规范化（abspath 不触碰文件系统，避免 BitLocker/缺失盘符
+    在 resolve() 时抛 OSError 拖垮参数拼装）；草稿文件存在性单独用 is_file 校验。
+    注：DFlash 的 --spec-draft-conf-min 在本引擎未实现（仅文档提及），暂不暴露。
+    """
+    target = os.path.normcase(os.path.abspath(model))
+    for m in cfg.get("models") or []:
+        if not isinstance(m, dict):
+            continue
+        if os.path.normcase(os.path.abspath(str(m.get("path") or ""))) != target:
+            continue
+        draft = str(m.get("DFlash2_draft_model") or "")
+        if not draft or not Path(draft).expanduser().is_file():
+            return None
+        return {
+            "type": "dflash",
+            "draft": str(Path(draft).expanduser()),
+            "n_max": m.get("spec_n_max"),
+        }
+    return None
 
 
 class Backend:
@@ -35,6 +63,9 @@ class Backend:
         self.model: str | None = None
         self.ctx: int | None = None
         self.port = None
+        # 当前 llama-server 进程 PID。正常 spawn 时 = self.proc.pid；
+        # attach 孤儿（非本进程子进程）时记录孤儿 PID，用于注册表与退出确认。
+        self.llama_pid: int | None = None
         # 当前模型的 GGUF 内嵌 chat_template（build_cmd 时探测一次）。
         # None 表示未加载或读取失败；用于判定模板是否支持 reasoning_effort 档位。
         self.chat_template: str | None = None
@@ -80,15 +111,22 @@ class Backend:
         # 的请求级注入，它们永远没有预算（server 默认 -1 = 不限制）。
         # GGUF 读不到 max output 时按 32K 兜底；CLI 请求仍会用 llm.py 按"输出窗口"
         # 算的精确预算覆盖（请求级字段优先）。
-        pct = EFFORT_THINK_PCT.get(cfg.get("reasoning_effort", "low"), 0.0)
+        pct = cfg.get("effort_think_pct", EFFORT_THINK_PCT).get(cfg.get("reasoning_effort", "low"), 0.0)
         budget = int(min(model_max_output(model), ctx) * pct)
         cmd += ["--reasoning-budget", str(budget)]
         if budget > 0:
-            # 上游机制：预算耗尽时在 </think> 前注入收尾文本，让模型自然收尾
-            cmd += ["--reasoning-budget-message", THINK_NUDGE]
-        # 投机解码：仅当模型内嵌 MTP (nextn) 层
-        if cfg.get("use_mtp", True) and nextn_layer_count(model) > 0:
-            cmd += ["--spec-type", "draft-mtp"]
+            # 上游机制：预算耗尽时在 </think> 前注入收尾文本，让模型自然收尾；
+            # 注入词来自 config.default_reasoning_budget_injection（可被 .max/config.json 覆盖）
+            cmd += ["--reasoning-budget-message", cfg["default_reasoning_budget_injection"]]
+        # 投机解码：优先使用配置的 DFlash2 草稿模型（完全取代 MTP——
+        # Qwen3.8 内嵌 MTP 层绑定 xHigh 思考，改 reasoning effort 后接受率雪崩
+        # 反而拖慢输出；DFlash 独立草稿模型无此耦合）。未配置草稿路径则关闭。
+        # spec_n_max 缺省不传，使用引擎默认（n_max=3）。
+        spec = _spec_draft_config(cfg, model)
+        if spec:
+            cmd += ["--spec-type", "draft-dflash", "--spec-draft-model", spec["draft"]]
+            if spec["n_max"] is not None:
+                cmd += ["--spec-draft-n-max", str(int(spec["n_max"]))]
         return cmd
 
     def _env(self) -> dict[str, str]:
@@ -113,10 +151,15 @@ class Backend:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             env=self._env())
         self.model, self.ctx = model, ctx
+        self.llama_pid = self.proc.pid
+        self.spec_info = _spec_draft_config(self.cfg, model)
         # --port 0：等 server 报出实际监听端口，拿到后才能和它通信
         self.port = self._discover_port(log_path, log_offset)
         self._client = httpx.Client(base_url=self.base_url, timeout=600)
         self.wait_ready()
+        orphan.set_llama(self.root, os.getpid(),
+                         {"pid": self.llama_pid, "port": self.port,
+                          "model": model, "ctx": ctx})
 
     def _discover_port(self, log_path: Path, offset: int) -> int:
         """轮询日志，从 `listening on http://host:PORT` 行解析实际端口。
@@ -160,20 +203,48 @@ class Backend:
             time.sleep(1.0)
         raise TimeoutError("llama-server 就绪超时")
 
+    def attach(self, port: int, model: str, ctx: int, llama_pid: int) -> None:
+        """接管一个孤儿 llama-server（非本进程 spawn 的子进程）。
+
+        复用其已加载的模型（模型仍驻留共享内存，零冷加载成本）；本 CLI 成为其
+        管理者，退出时照常发 /max/shutdown 触发其退出。失败（孤儿已死）抛异常，
+        调用方回退正常启动流程。
+        """
+        self.stop()
+        self.port = int(port)
+        self.model = model
+        self.ctx = ctx
+        self.llama_pid = int(llama_pid)
+        self.proc = None   # 不是本进程的子进程：stop() 只发信号，不 wait/kill
+        self._client = httpx.Client(base_url=self.base_url, timeout=600)
+        try:
+            self.wait_ready()
+        except Exception:
+            self._client.close()
+            self._client = None
+            self.port = None
+            self.llama_pid = None
+            raise
+        orphan.set_llama(self.root, os.getpid(),
+                         {"pid": self.llama_pid, "port": self.port,
+                          "model": model, "ctx": ctx})
+
     def stop(self) -> None:
         """优雅退出：POST /max/shutdown（Windows 跨进程信号不可靠），超时硬杀。
 
         uvicorn 退出钩子会先落盘 KV 缓存到 SSD（384K×3 上下文可能耗时数十秒），
         wait 宽限已覆盖该耗时；硬杀后仍不退出的进程直接放弃——
         任何路径都不抛异常，退出流程不被 TimeoutExpired 打断。
+        attach 模式（proc 为 None）只发 shutdown 信号，不 wait/kill 非子进程。
         """
         try:
+            # 只要有已知端口就发 shutdown（正常 spawn 与 attach 共用）
+            if self.port is not None and self._client is not None:
+                try:
+                    self._client.post("/max/shutdown", timeout=15)
+                except (httpx.HTTPError, OSError):
+                    pass
             if self.proc is not None and self.proc.poll() is None:
-                if self._client is not None:
-                    try:
-                        self._client.post("/max/shutdown", timeout=15)
-                    except (httpx.HTTPError, OSError):
-                        pass
                 try:
                     self.proc.wait(timeout=SHUTDOWN_GRACE_S)
                 except subprocess.TimeoutExpired:
@@ -200,7 +271,10 @@ class Backend:
         return f"http://127.0.0.1:{self.port or 1}"
 
     def healthy(self) -> bool:
-        if not self.proc or self.proc.poll() is not None or self._client is None:
+        if self.port is None or self._client is None:
+            return False
+        # attach 模式下 proc 为 None（非子进程），只按服务可用性判定
+        if self.proc is not None and self.proc.poll() is not None:
             return False
         try:
             return self._client.get("/health", timeout=2).status_code == 200

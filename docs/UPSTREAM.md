@@ -159,7 +159,7 @@
 
 ### R01 reasoning-budget 软注入（soft nudge）— ✅ 已删除，完全切上游
 
-**切换决策（2026-08-19，用户确认）：** 实际使用发现软注入对 Qwen3.6 有效、对 Qwen3.8 效果不大；改用上游"预算耗尽时在 `</think>` 前注入文本"（`--reasoning-budget-message`），让模型以为自己是自然收尾，效果更好。注入命令后续按模型分别配置（Python 层 `THINK_NUDGE` 常量）。
+**切换决策（2026-08-19，用户确认）：** 实际使用发现软注入对 Qwen3.6 有效、对 Qwen3.8 效果不大；改用上游"预算耗尽时在 `</think>` 前注入文本"（`--reasoning-budget-message`），让模型以为自己是自然收尾，效果更好。注入命令后续按模型分别配置（Python 层 `config.py` 的 `default_reasoning_budget_injection` 键，`.max/config.json` 可覆盖）。
 **执行结果：** 引擎侧 7 文件恢复上游 + 4 文件删软注入参数；Python 侧 backend.py 改用 `--reasoning-budget-message`、llm.py `think_budget_kwargs` 改用 `reasoning_budget_message`。构建 + 冒烟验证通过。
 
 ### R02 effort→预算绑定（Python 层，不在 C++ 补丁内）
@@ -171,4 +171,4 @@
 
 **原因与意图：** 用户级 effort 档位（off/low/medium/xHigh）映射思考预算，与 CLI 7 档上下文档位同层。
 **上游关系：** 无关（前端 Python 层）。
-**核对/重做要点：** rebase 不影响；但若上游 `--reasoning-budget-message` 语义变化需同步映射。注入文本统一走 `THINK_NUDGE`（计划按模型拆分配置）。
+**核对/重做要点：** rebase 不影响；但若上游 `--reasoning-budget-message` 语义变化需同步映射。注入文本统一走配置键 `default_reasoning_budget_injection`（计划按模型拆分配置）。

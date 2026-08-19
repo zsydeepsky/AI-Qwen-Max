@@ -15,7 +15,7 @@ from fastapi.testclient import TestClient   # type: ignore[import]
 
 from ai_qwen_max.backend import Backend
 from ai_qwen_max.config import CTX_CHOICES, Config
-from ai_qwen_max.gguf import nextn_layer_count
+from ai_qwen_max.gguf import model_max_output
 from ai_qwen_max.server import AppCtx, create_app, web_dir
 from ai_qwen_max.store import SessionStore
 
@@ -85,9 +85,9 @@ def main() -> int:
     print("[gguf]")
     model = Path(os.environ.get("MAX_TEST_MODEL", ""))
     if model.is_file():
-        n = nextn_layer_count(model)
-        check(f"nextn探测 {model.name}", n >= 0)
-        print(f"       nextn_predict_layers = {n}")
+        n = model_max_output(model)
+        check(f"max_output 探测 {model.name}", n >= 0)
+        print(f"       max_output = {n}")
     else:
         print("  skip（未设置 MAX_TEST_MODEL 或文件不存在）")
 
@@ -212,7 +212,7 @@ def main() -> int:
     b_long = LLM(_FakeBk(ctx - 512), effort="xHigh", ctx=ctx)._think_budget(long_msgs, -1)
     check("prompt≈ctx → tiny budget", 0 <= b_long < 1000)
     b_cap = LLM(_FakeBk(10), effort="medium", ctx=ctx)._think_budget(msgs, 8192)
-    check("max_tokens caps ceiling", b_cap == int(0.10 * (8192 - 10 - TEMPLATE_OVERHEAD)))
+    check("max_tokens caps ceiling", b_cap == int(0.15 * (8192 - 10 - TEMPLATE_OVERHEAD)))
     b_fb = LLM(_FakeBk(None), effort="xHigh", ctx=ctx)._think_budget(msgs, -1)
     check("tokenize fail → fallback ctx×pct", b_fb == int(0.30 * ctx))
     b_zero = LLM(_FakeBk(10), effort="low", ctx=0)._think_budget(msgs, -1)

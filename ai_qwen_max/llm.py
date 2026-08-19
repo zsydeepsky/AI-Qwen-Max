@@ -25,8 +25,8 @@ class GenResult:
         "prefill_s", "decode_s",          # PP / TG 分段耗时（基于 usage.timings 时覆盖）
         "prefill_tps", "decode_tps",      # tok/s
         "dur_s",                          # 整轮总耗时（monotonic 差值）
-        "draft_attempted", "draft_accepted",  # MTP 统计
-        "mtp_efficiency",                 # accepted / attempted（≥1 是 MTP overrun）
+        "draft_attempted", "draft_accepted",  # 投机解码统计（DFlash2/MTP）
+        "draft_ratio",                 # accepted / attempted = 命中率（≥1 是 MTP overrun）
     )
 
     def __init__(self) -> None:
@@ -43,7 +43,7 @@ class GenResult:
         self.dur_s: float | None = None
         self.draft_attempted = 0
         self.draft_accepted = 0
-        self.mtp_efficiency: float | None = None
+        self.draft_ratio: float | None = None
 
     @property
     def tps(self) -> float | None:
@@ -100,39 +100,35 @@ def effort_system_injection(effort: str, tpl: str | None) -> str | None:
 # off = 思考关闭；其余档位在预算耗尽时强制 </think>（收尾文本由
 # --reasoning-budget-message / reasoning_budget_message 注入，让模型自然收尾）
 # 输出窗口 = min(max_tokens, ctx) − prompt_token − 模板余量（见 _think_budget）
-EFFORT_THINK_PCT = {"off": 0.0, "low": 0.03, "medium": 0.10, "xHigh": 0.30}
+EFFORT_THINK_PCT = {"off": 0.0, "low": 0.03, "medium": 0.15, "xHigh": 0.30}
 
 # 模板/system/think 标记等非对话内容 token 开销余量，从输出窗口中扣除，
 # 避免 prompt 占满 ctx 时预算仍虚高、注入永远没有触发空间
 TEMPLATE_OVERHEAD = 256
 
-# 收尾文本：第一人称自嗓音（Qwen3 CoT 原生分布），
-# 以 Qwen3 收尾公式 "Okay, let me ... write the final answer" 结尾，
-# 预算耗尽时在 </think> 前注入，把 P(下一个 token 是 </think>) 推到峰值。
-THINK_NUDGE = (
-    "\n\n...wait, I'm approaching the output limit. I must stop analyzing now.\n"
-    "I've already worked out the key points above — they are sufficient.\n"
-    "I can always make changes later, it's good enough for now.\n"
-    "Okay, let me close my thinking here and write the final answer directly,\n"
-    "keeping it clear and concise.\n\n"
-)
+# 收尾文本不在此硬编码：由 config.default_reasoning_budget_injection 提供
+# （第一人称自嗓音，Qwen3 CoT 原生分布，预算耗尽时在 </think> 前注入，
+# 把 P(下一个 token 是 </think>) 推到峰值）。.max/config.json 可覆盖，
+# 后续按模型拆分配置各模型的注入命令。
 
 
-def think_budget_kwargs(effort: str, budget: int) -> dict:
+def think_budget_kwargs(effort: str, budget: int, nudge: str) -> dict:
     """think_budget > 0 且思考开启时：预算耗尽时在 </think> 前注入收尾文本。"""
     if budget <= 0 or effort in ("off", "none"):
         return {}
     return {
         "reasoning_budget_tokens": budget,
-        "reasoning_budget_message": THINK_NUDGE,
+        "reasoning_budget_message": nudge,
     }
 
 
 class LLM:
-    def __init__(self, backend, effort: str = "low", ctx: int = 0):
+    def __init__(self, backend, effort: str = "low", ctx: int = 0,
+                 effort_think_pct: dict | None = None):
         self.backend = backend   # Backend 实例
         self.effort = effort
         self.ctx = ctx           # context window（tokens）；思考预算 = 输出窗口 × effort 档百分比
+        self.effort_think_pct = effort_think_pct   # 生产值来自 config.effort_think_pct；None 用内置默认
 
     # ---- 思考预算 ----
 
@@ -161,7 +157,7 @@ class LLM:
         输出窗口 = min(max_tokens(若>0), ctx) − prompt_token − 模板余量。
         prompt 越长预算越小：软注入（80%）永远有触发空间，思考不会烧到上下文墙。
         """
-        pct = EFFORT_THINK_PCT.get(self.effort, 0.0)
+        pct = (self.effort_think_pct or EFFORT_THINK_PCT).get(self.effort, 0.0)
         if pct <= 0 or not self.ctx:
             return 0
         ceiling = min(max_tokens, self.ctx) if max_tokens and max_tokens > 0 else self.ctx
@@ -194,7 +190,9 @@ class LLM:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "chat_template_kwargs": effort_chat_kwargs(self.effort, tpl),
-            **think_budget_kwargs(self.effort, self._think_budget(msgs, max_tokens)),
+            **think_budget_kwargs(
+                self.effort, self._think_budget(msgs, max_tokens),
+                self.backend.cfg["default_reasoning_budget_injection"]),
         }
         with httpx.stream("POST", f"{self.backend.base_url}/v1/chat/completions",
                           json=payload, timeout=httpx.Timeout(600, connect=10)) as r:
@@ -244,8 +242,7 @@ class LLM:
             elif n_words:
                 res.decode_tps = n_words / est_decode
         if res.draft_attempted:
-            res.mtp_efficiency = (res.draft_accepted / res.draft_attempted
-                                  if res.draft_attempted else None)
+            res.draft_ratio = res.draft_accepted / res.draft_attempted
         return res
 
     # ---- 非流式补全（标题生成等辅助请求，不污染缓存池）----
@@ -395,8 +392,7 @@ def _apply_footer(res: GenResult, footer: dict) -> None:
     if res.cache_tokens > res.prompt_tokens:
         res.cache_tokens = res.prompt_tokens
     if res.draft_attempted:
-        res.mtp_efficiency = (res.draft_accepted / res.draft_attempted
-                              if res.draft_attempted else None)
+        res.draft_ratio = res.draft_accepted / res.draft_attempted
 
 
 def _iter_sse_deltas(response: httpx.Response) -> Iterator[tuple[str, str]]:

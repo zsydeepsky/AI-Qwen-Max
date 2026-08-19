@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import threading
 from pathlib import Path
@@ -21,6 +22,7 @@ from . import __version__
 from .backend import Backend
 from .cli import Cli
 from .config import Config
+from .orphan import detect, probe_llama, register, terminate, unregister
 from .server import AppCtx, create_app
 from .store import SessionStore
 
@@ -88,6 +90,48 @@ def main() -> int:
     t = threading.Thread(target=userver.run, daemon=True)
     t.start()
 
+    # 先登记自己：attach/start 里的 set_llama 依赖本条目的存在，注册须在前
+    register(inst_dir, os.getpid(), int(cfg["port"]))
+
+    # ---- 孤儿检测：僵死 CLI 终结 + 孤儿 llama-server attach 复用 ----
+    # 目标：避免 CLI 被强杀后 llama-server（~71GB）沦为孤儿；有孤儿则直接接入
+    # 复用（模型仍在共享内存），退出本 CLI 时自然触发其退出。
+    zombie_clis, orphan_llamas = [], []
+    try:
+        zombie_clis, orphan_llamas = detect(inst_dir, os.getpid())
+    except Exception as e:      # 注册表损坏等极端情况不阻断启动
+        print(f"[warn] 孤儿检测失败，继续正常启动：{e}")
+    for z in zombie_clis:
+        print(f"检测到僵死 AI-Qwen-Max 进程 (pid={z['pid']})，正在终结…")
+        terminate(z["pid"])
+        unregister(inst_dir, z["pid"])
+    attach_info: tuple[str, int] | None = None
+    if orphan_llamas:
+        if len(orphan_llamas) > 1:
+            print(f"检测到 {len(orphan_llamas)} 个孤儿 llama-server，仅接入第一个，其余保留。")
+        o = orphan_llamas[0]
+        model, ctx = o.get("model"), o.get("ctx")
+        if not model or not ctx:
+            print("[warn] 孤儿 llama-server 条目缺 model/ctx，跳过接入。")
+        else:
+            print(f"检测到孤儿 llama-server（模型 {Path(model).stem}，ctx={ctx}），正在接入…")
+            try:
+                # 孤儿可能已退出/PID 被无关进程复用：先快速预探测 /health，
+                # 避免 attach 的 wait_ready（600s）空转拖死启动
+                if probe_llama(int(o["port"])):
+                    backend.attach(int(o["port"]), model, int(ctx), int(o["pid"]))
+                    attach_info = (model, int(ctx))
+                else:
+                    print(f"[warn] 孤儿 llama-server（port={o['port']}）已不可达，跳过接入。")
+            except Exception as e:
+                print(f"[warn] 接入失败（{e}），将走正常启动流程。")
+                attach_info = None
+            finally:
+                # 来源条目 CLI 已死：无论接入成败该条目都已失效，注销以免残留
+                from_pid = o.get("_from_cli_pid")
+                if from_pid:
+                    unregister(inst_dir, int(from_pid))
+
     try:
         if args.serve:
             print(f"AI-Qwen-Max v{__version__} 服务模式：http://127.0.0.1:{cfg['port']}  (/help)")
@@ -95,14 +139,19 @@ def main() -> int:
                 t.join(timeout=1.0)
         else:
             assert cli is not None
-            # llama-server 在选定模型后由 _load 启动：--port 0 由 OS 分配可用端口，
-            # Backend 从日志发现实际端口后自动对接，用户无需关心
-            cli.run(model_preset=args.model, ctx_preset=args.ctx)
+            if attach_info:
+                # attach 模式：跳过模型/档位/思考强度选择，直接复用孤儿服务器
+                cli.run_attached(*attach_info)
+            else:
+                # llama-server 在选定模型后由 _load 启动：--port 0 由 OS 分配可用端口，
+                # Backend 从日志发现实际端口后自动对接，用户无需关心
+                cli.run(model_preset=args.model, ctx_preset=args.ctx)
     except (KeyboardInterrupt, SystemExit):
         pass
     finally:
         print("\n正在关闭（保存 KV 缓存到 SSD）…")
         backend.stop()
+        unregister(inst_dir, os.getpid())
     return 0
 
 

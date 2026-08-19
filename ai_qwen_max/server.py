@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 import time
 import uuid
@@ -19,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import __version__
 from .backend import Backend
 from .config import CTX_CHOICES, Config
 from .dsh import sync_dsh_input
@@ -57,6 +59,7 @@ class AppCtx:
         self._aclient_base: str | None = None
         self.last_perf: dict[str, Any] = {}
         self.uvicorn_server = None   # 由 __main__ 注入，用于优雅停机
+        self.started_ts = time.time()   # /backend 报告用：实例启动时间
 
     @property
     def aclient(self) -> httpx.AsyncClient:
@@ -79,6 +82,24 @@ def create_app(actx: AppCtx) -> FastAPI:
 
     def jerr(status: int, msg: str) -> JSONResponse:
         return JSONResponse({"error": {"message": msg, "type": "max_error"}}, status_code=status)
+
+    # ================ /backend：孤儿检测探测端点 ================
+    # 报告本 CLI 实例与其连接的 llama-server（供新启动的实例识别孤儿进程）。
+
+    @app.get("/backend")
+    def api_backend():
+        """本实例身份 + 所连 llama-server。llama 为 null 表示尚未 spawn/attach。"""
+        b = actx.backend
+        llama = None
+        if b.port is not None:
+            llama = {"pid": b.llama_pid, "port": b.port, "model": b.model, "ctx": b.ctx}
+        return {
+            "pid": os.getpid(),
+            "port": int(actx.cfg.get("port", 0) or 0),
+            "version": __version__,
+            "started": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(actx.started_ts)),
+            "llama": llama,
+        }
 
     # ================ /api/stats：精确引擎查询（空闲/PP/TG + KV 缓存池） ================
 
@@ -520,10 +541,13 @@ def create_app(actx: AppCtx) -> FastAPI:
 
     @app.post("/model/load")
     async def model_load(model: str = "", ctx: int = 0):
+        actx.cfg.load()  # 热换：重新读盘，config.json 的模型/spec 参数改动即时生效
         models = actx.cfg.get("models") or []
         path = model
         if model.isdigit() and int(model) < len(models):
-            path = models[int(model)]
+            entry = models[int(model)]
+            # models 为对象列表 {"path": ..., "DFlash2_draft_model": ...}（兼容旧字符串）
+            path = entry.get("path", "") if isinstance(entry, dict) else entry
         if not path:
             return jerr(400, f"模型不存在：{model}")
         # 文件或目录都解析到实际 gguf（目录取最大的主模型文件）

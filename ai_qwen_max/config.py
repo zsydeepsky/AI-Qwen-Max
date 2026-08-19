@@ -12,7 +12,10 @@ from typing import Any
 CTX_CHOICES = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "models": [],                # GGUF 绝对路径列表
+    # 模型对象列表：{"path": GGUF 绝对路径,
+    #               "DFlash2_draft_model": 可选 DFlash2 草稿模型路径,
+    #               "spec_n_max": 可选草稿 token 上限（默认 3，DFlash2 上限=block size 8）}
+    "models": [],
     "default_model": "",         # 上次交互选中的模型（启动时 Enter 直接使用）
     "lang": "zh",                # 界面语言 zh | en
     "default_ctx": 32768,        # 新会话默认档位
@@ -25,8 +28,19 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cache_ssd_ttl_hours": 24,   # SSD 条目存活时间
     "avail_mem_min_gb": 4,       # 系统可用内存低于此值不做主动驱逐判断
     "cache_ram_target_gb": 16,   # RAM 池软上限（驱逐参考）
-    "reasoning_effort": "low",   # off | low | medium | xHigh（思考预算按档绑定 max_output 百分比：3%/10%/30%）
-    "use_mtp": True,             # 投机解码（模型支持 nextn 时自动启用）
+    "reasoning_effort": "low",   # off | low | medium | xHigh（思考预算百分比见 effort_think_pct）
+    # effort → 思考预算占输出窗口百分比（off 恒定 0；预算耗尽时强制 </think> 收尾，
+    # 收尾文本由 default_reasoning_budget_injection 注入）。可在 .max/config.json 覆盖。
+    "effort_think_pct": {"off": 0.0, "low": 0.03, "medium": 0.15, "xHigh": 0.30},
+    # 思考预算耗尽时在 </think> 前注入的收尾文本（模型第一人称自嗓音，让模型自然收尾）；
+    # 默认值针对 Qwen3.6 调优，后续按模型拆分配置时在 .max/config.json 覆盖
+    "default_reasoning_budget_injection": (
+        "\n\n...wait, I'm approaching the output limit. I must stop analyzing now.\n"
+        "I've already worked out the key points above — they are sufficient.\n"
+        "I can always make changes later, it's good enough for now.\n"
+        "Okay, let me close my thinking here and write the final answer directly,\n"
+        "keeping it clear and concise.\n\n"
+    ),
 }
 
 
@@ -45,8 +59,14 @@ class Config:
             except (json.JSONDecodeError, OSError):
                 # 损坏的配置：保留默认值继续跑，不崩
                 pass
-        # 兼容旧配置：剔除已废弃的 power 档位键
+        # 兼容旧配置：
+        # - 剔除已废弃的 power 档位键与 use_mtp（MTP 已完全被 DFlash2 取代）
+        # - models 从字符串路径列表升级为对象列表 {"path": ..., "DFlash2_draft_model": ...}
         self.data.pop("power", None)
+        self.data.pop("use_mtp", None)
+        models = self.data.get("models") or []
+        if models and all(isinstance(m, str) for m in models):
+            self.data["models"] = [{"path": m} for m in models if m]
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

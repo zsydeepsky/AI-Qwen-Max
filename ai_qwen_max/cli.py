@@ -447,7 +447,7 @@ class Cli:
             ctx = self._select_ctx(ctx_preset)
             ctx_preset = 0
             effort = self._select_effort()
-            self.llm.ctx = ctx     # CLI 精确预算 = 输出窗口 × effort 档（off=0/low=3%/medium=10%/xHigh=30%）
+            self.llm.ctx = ctx     # CLI 精确预算 = 输出窗口 × effort 档（off=0/low=3%/medium=15%/xHigh=30%）
             err, dur = self._load(model, ctx)
             if err is not None:
                 print(self.L("load_fail", e=err))
@@ -455,6 +455,25 @@ class Cli:
             print(_dim("  " + self.L("load_ok", t=dur)))
             self._print_header(model, ctx, effort)
             break
+        self._start_title_updater()
+        try:
+            self._menu_loop()
+        finally:
+            self._stop_title_updater()
+            _set_title("idle")
+
+    def run_attached(self, model: str, ctx: int) -> None:
+        """attach 孤儿 llama-server 模式：跳过模型/档位/思考强度选择，直接进功能菜单。
+
+        backend 已由调用方 attach（模型/ctx 沿用孤儿服务器启动时的值）；
+        effort 用配置默认（CLI 请求级注入，不影响引擎级 --reasoning-budget）。
+        """
+        _widen_console()
+        effort = str(self.cfg.get("reasoning_effort", "low"))
+        self.llm.effort = effort
+        self.llm.ctx = ctx
+        print(_dim("  " + self.L("load_ok", t=0)))
+        self._print_header(model, ctx, effort)
         self._start_title_updater()
         try:
             self._menu_loop()
@@ -555,7 +574,7 @@ class Cli:
 
     def _print_header(self, model: str, ctx: int, effort: str) -> None:
         ctx_label = f"{ctx // 1024}K"
-        pct = EFFORT_THINK_PCT.get(effort, 0.0)
+        pct = self.cfg.get("effort_think_pct", EFFORT_THINK_PCT).get(effort, 0.0)
         budget = int(min(model_max_output(model), ctx) * pct)   # 与引擎启动默认同口径
         effort_label = effort if pct <= 0 else f"{effort}·think {budget // 1024}K"
         media = model_media(model)   # 文本/图片/音频
@@ -594,7 +613,10 @@ class Cli:
 
     def _select_model(self, preset: str = "") -> str:
         while True:
-            models = [m for m in (self.cfg.get("models") or []) if Path(m).exists()]
+            # models 为对象列表 {"path": ..., "DFlash2_draft_model": ...}（兼容旧字符串）
+            entries = [m for m in (self.cfg.get("models") or [])
+                       if isinstance(m, dict) and Path(str(m.get("path") or "")).exists()]
+            models = [m["path"] for m in entries]
             saved = self.cfg.get("default_model", "")
             saved = saved if saved in models else ""
             print(f"\n===== {self.L('model_title')} =====")
@@ -634,7 +656,7 @@ class Cli:
                 continue
             if p not in models and p.lower().endswith(".gguf"):
                 registered = list(self.cfg.get("models") or [])
-                registered.append(p)
+                registered.append({"path": p})
                 self.cfg.data["models"] = registered
                 print(_dim(self.L("model_registered")))
             self._remember_model(p)
@@ -944,6 +966,14 @@ class Cli:
             f"PP {res.prefill_tps:.1f} t/s" if res.prefill_tps else "PP --")
         bits.append(
             f"TG {res.decode_tps:.2f} t/s" if res.decode_tps else "TG --")
+        # 投机解码统计：按类型显示预测长度 + 命中率（accepted / attempted）
+        if res.draft_ratio is not None:
+            spec = getattr(self.backend, "spec_info", None) or {}
+            stype = spec.get("type")
+            tag = {"dflash": "DF2", "mtp": "MTP"}.get(stype, "SPD")
+            n = spec.get("n_max")
+            head = f"{tag} {n}tok" if n else tag
+            bits.append(f"{head} {res.draft_ratio * 100:.0f}%")
         if interrupted:
             bits.append("已中断(半截保留)")
         return f"── {' │ '.join(bits)} ──" if bits else ""

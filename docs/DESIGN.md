@@ -46,9 +46,10 @@ L1  推理引擎     llama-server（:8081 子进程，vendor/llama.cpp ryzen-uma
 - 混合架构（SSM+attention）回滚依赖 checkpoint 而非 KV shift。上游只在 prompt 期建 checkpoint → 上一轮回复在下轮被整体重算。定制：解码期每 256 token 滚动快照（保留 2 份）+ 生成结束终拍。
 - 贪心生成逐 token 输出与重渲染整段 tokenize 的 BPE 边界分歧会击穿 token 级 LCP。定制：retokenize_with_cache（文本级 LCP + detokenize 往返校验），候选池 = 活跃 slot + RAM states（SSD 仅冷启动时参与）。
 
-### 3.4 投机解码：MTP（模型内嵌 nextn 头）
-- `--spec-type draft-mtp`，仅当 GGUF 含 `{arch}.nextn_predict_layers > 0`（Python 前端自动探测，A3B 等无 MTP 模型自动跳过）。
-- 已否决：独立 CPU draft 模型（draft-simple）、prefill 协同 row-split（未达收益预期）。
+### 3.4 投机解码：DFlash2（独立草稿模型，取代 MTP）
+- 曾用 MTP（模型内嵌 nextn 头，`--spec-type draft-mtp`）：Qwen3.8 的 MTP 层绑定 xHigh 思考，改动 reasoning effort 后接受率雪崩，不仅无增益还拖慢输出 —— 已整体移除。
+- 现用 `--spec-type draft-dflash --spec-draft-model <draft.gguf>`：草稿模型路径由每个模型对象的 `DFlash2_draft_model` 字段配置（`config.models` 对象列表），未配置则关闭投机解码。
+- 可选调优字段（缺省不传，用引擎默认）：`spec_n_max` 草稿 token 上限（默认 3，DFlash2 上限=block size 8）。`/model/load` 每次重读 config，改字段后热换即时生效。注：DFlash 的 `--spec-draft-conf-min` 本引擎未实现（仅文档提及），暂不暴露。
 
 ### 3.5 UMA 内存（Strix Halo 关键修复）
 - AMD Windows 驱动的 HostVisible 非 HostCached 内存映射为 write-combined，CPU 读 ~100MB/s，SSM checkpoint 快照（150MiB）耗时 1.4s。
@@ -71,7 +72,7 @@ L1  推理引擎     llama-server（:8081 子进程，vendor/llama.cpp ryzen-uma
 ai_qwen_max/
 ├── __main__.py   入口：argparse + 组装 + uvicorn(后台线程) + CLI 前台
 ├── config.py     Config（.max/config.json，原子写，默认值即生产基线）
-├── gguf.py       GGUF 头解析（nextn 层探测，纯标准库）
+├── gguf.py       GGUF 头解析（模板/多模态/输出上限探测，纯标准库）
 ├── backend.py    Backend：进程生命周期 / 参数拼装 / ready 探测 / 优雅退出
 ├── store.py      SessionStore/Session：会话持久化（原子写 + dialogue 回放 + media）
 ├── events.py     ApiEvents：/api/events 环形缓冲 + SSE 差量推送
@@ -101,6 +102,6 @@ ai_qwen_max/
 | TurboQuant TQ4 | ❌ | 行为级降智（拒用工具），decode 仅 +2% |
 | 功耗 profile | ❌ | 修改电源计划无收益，进程内参数已足够 |
 | SSD 缓存无损压缩 | ❌ | q8_0 残差熵近满，deflate 仅省 5-6% |
-| 独立 CPU draft | ❌ | MTP 内嵌头已覆盖，收益不及复杂度 |
+| MTP 内嵌头（Qwen3.8） | ❌ | 绑定 xHigh 思考，改 effort 后接受率雪崩反而拖慢输出；已由 DFlash2 独立草稿模型取代 |
 | prefill row-split 协同 | ❌ | 层数指派未达收益预期 |
 | l-tile GEMM | ⏸ | 驱动版本相关，当前驱动 -38% 保持关闭（`GGML_VK_AMD_L_TILES=0`），驱动更新后重测 |

@@ -1,4 +1,4 @@
-"""GGUF 元数据探测：仅用标准库解析头部键值，判断模型是否带 MTP (nextn) 层。"""
+"""GGUF 元数据探测：仅用标准库解析头部键值，判断模型能力（模板/多模态/输出上限）。"""
 
 from __future__ import annotations
 
@@ -83,23 +83,6 @@ def _read_value(f, vtype: int):
         (n,) = struct.unpack("<Q", f.read(8))
         return [_read_value(f, etype) for _ in range(n)]
     raise ValueError(f"unknown gguf value type {vtype}")
-
-
-def nextn_layer_count(path: str | Path) -> int:
-    """返回 {arch}.nextn_predict_layers 的层数（>0 表示模型内嵌 MTP draft 层）。
-
-    例如 Qwen3.8-27B: qwen3.nextn_predict_layers = 1；A3B 无此键或为 0。
-    """
-    try:
-        hit = _find_key(path, ".nextn_predict_layers")
-    except (OSError, ValueError, struct.error):
-        return 0
-    if hit is None:
-        return 0
-    try:
-        return int(hit[1])  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0
 
 
 def model_arch(path: str | Path) -> str:

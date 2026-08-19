@@ -222,7 +222,7 @@ case REASONING_BUDGET_SOFT_INJECT:
 
 ### 4.3 上提评估（历史记录）
 
-软注入曾作为独有薄扩展上提候选 #2，**已随 R01 切换关闭**。effort → 预算映射保留在 Python 层（`ai_qwen_max/backend.py` 的 `EFFORT_THINK_PCT` + `llm.py` 的 `THINK_NUDGE`，计划按模型拆分配置注入命令）。
+软注入曾作为独有薄扩展上提候选 #2，**已随 R01 切换关闭**。effort → 预算映射保留在 Python 层（`ai_qwen_max/backend.py` 的 `EFFORT_THINK_PCT` + `config.py` 的 `default_reasoning_budget_injection`，计划按模型拆分配置注入命令）。
 
 ---
 
@@ -244,7 +244,7 @@ case REASONING_BUDGET_SOFT_INJECT:
 
 1. **先重建缓存支柱**（收益最大、依赖最深）：按 §1 重建 SSD 层（迁新文件 + 4 钩子）、按 §2.1 重建生成段 checkpoint、按 §2.2 重建 BPE 治愈。这三者相互依赖（治愈依赖缓存候选，checkpoint 依赖治愈对齐），必须成套验证。
 2. **平台性能**：引擎层（C04 Vulkan / C05 ggml-alloc）由引擎仓库自行核对（见其 CORE_MODIFICATIONS.md §3 rebase 重挂清单）；本工程产品层不涉及，无需处理。
-3. **思考预算**：已完全使用上游 `--reasoning-budget` / `--reasoning-budget-message`（软注入已于 2026-08-19 删除），无需重建；注入命令在 Python 层 `THINK_NUDGE` 配置。
+3. **思考预算**：已完全使用上游 `--reasoning-budget` / `--reasoning-budget-message`（软注入已于 2026-08-19 删除），无需重建；注入命令在配置键 `default_reasoning_budget_injection` 设置。
 4. **小项**：按 §5 表逐项过（多数是独立小改动，低风险）。
 5. **每步验证**：跑 `scripts/bench.py` 同参对比 + 缓存命中 TTFT（~84ms 基准），确认重建未破坏缓存链路。
 
