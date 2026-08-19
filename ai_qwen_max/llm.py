@@ -97,17 +97,18 @@ def effort_system_injection(effort: str, tpl: str | None) -> str | None:
 
 
 # 思考预算按 effort 档绑定"输出窗口"百分比：
-# off = 思考关闭；其余档位在消耗到预算 80% 时注入诱导语，100% 时强制 </think>
+# off = 思考关闭；其余档位在预算耗尽时强制 </think>（收尾文本由
+# --reasoning-budget-message / reasoning_budget_message 注入，让模型自然收尾）
 # 输出窗口 = min(max_tokens, ctx) − prompt_token − 模板余量（见 _think_budget）
 EFFORT_THINK_PCT = {"off": 0.0, "low": 0.03, "medium": 0.10, "xHigh": 0.30}
 
 # 模板/system/think 标记等非对话内容 token 开销余量，从输出窗口中扣除，
-# 避免 prompt 占满 ctx 时预算仍虚高、软注入永远没有触发空间
+# 避免 prompt 占满 ctx 时预算仍虚高、注入永远没有触发空间
 TEMPLATE_OVERHEAD = 256
 
-# 诱导语：第一人称自嗓音（Qwen3 CoT 原生分布），
+# 收尾文本：第一人称自嗓音（Qwen3 CoT 原生分布），
 # 以 Qwen3 收尾公式 "Okay, let me ... write the final answer" 结尾，
-# 把 P(下一个 token 是 </think>) 推到峰值。
+# 预算耗尽时在 </think> 前注入，把 P(下一个 token 是 </think>) 推到峰值。
 THINK_NUDGE = (
     "\n\n...wait, I'm approaching the output limit. I must stop analyzing now.\n"
     "I've already worked out the key points above — they are sufficient.\n"
@@ -118,13 +119,12 @@ THINK_NUDGE = (
 
 
 def think_budget_kwargs(effort: str, budget: int) -> dict:
-    """think_budget > 0 且思考开启时：软注入（80%）+ 硬终结（100% 强制 </think>）。"""
+    """think_budget > 0 且思考开启时：预算耗尽时在 </think> 前注入收尾文本。"""
     if budget <= 0 or effort in ("off", "none"):
         return {}
     return {
         "reasoning_budget_tokens": budget,
-        "reasoning_budget_soft_message": THINK_NUDGE,
-        "reasoning_budget_soft_ratio": 0.8,
+        "reasoning_budget_message": THINK_NUDGE,
     }
 
 

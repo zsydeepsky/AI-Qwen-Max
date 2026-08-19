@@ -84,10 +84,8 @@ class Backend:
         budget = int(min(model_max_output(model), ctx) * pct)
         cmd += ["--reasoning-budget", str(budget)]
         if budget > 0:
-            cmd += [
-                "--reasoning-budget-soft-message", THINK_NUDGE,
-                "--reasoning-budget-soft-ratio", "0.8",
-            ]
+            # 上游机制：预算耗尽时在 </think> 前注入收尾文本，让模型自然收尾
+            cmd += ["--reasoning-budget-message", THINK_NUDGE]
         # 投机解码：仅当模型内嵌 MTP (nextn) 层
         if cfg.get("use_mtp", True) and nextn_layer_count(model) > 0:
             cmd += ["--spec-type", "draft-mtp"]
