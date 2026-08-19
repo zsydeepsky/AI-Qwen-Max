@@ -1,8 +1,8 @@
-# 引擎定制补丁说明（vendor/llama.cpp @ qwenmax 分支）
+# 产品层补丁说明（vendor/llama.cpp @ ryzen-uma-vulkan 分支）
 
 **简体中文** ｜ [English](ENGINE_PATCHES.en.md)
 
-`qwenmax` 分支 = 上游 [Nathanw1014/llama.cpp](https://github.com/Nathanw1014/llama.cpp) `strix-halo-vulkan` 分支（基线 `baf0025de`）之上的一个定制 commit。按功能域列出全部改动，便于 code review 与上游 rebase。
+架构（2026-08-19 拆分）：引擎仓库 = **纯平台层**（[Ryzen-UMA-Vulkan-llama](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama)，`ryzen-uma-vulkan` 分支 = 上游 [Nathanw1014/llama.cpp](https://github.com/Nathanw1014/llama.cpp) `strix-halo-vulkan` 分支 + Vulkan/UMA 平台优化，可独立发行）。本文件列出的**产品层定制**以 `patches/qwenmax-server-layer.patch` 在构建时叠加（见 scripts/build.ps1 3b 步；引擎升级后用 scripts/refresh-patch.ps1 重新生成）。按功能域列出全部改动，便于 code review 与上游 rebase。
 
 ## A. SSD prompt cache（保留定制的主体，~700 行）
 
@@ -34,7 +34,7 @@
 
 - **reads_clean 快路径**：`vk_device_struct.reads_clean`（atomic）+ `vk_command_pool::owner_device`；UMA 读在无在途提交时跳过 per-tensor barrier+submit+fence，直接 memcpy。
 - **memtypes**：`ggml_vk_find_memory_properties/create_buffer` 加 `exclude_flags`；`prefer_host_memory` 默认强制 true（HostCached GTT 三级链），修复 AMD Windows WC 映射读回 ~100MB/s。`GGML_VK_PREFER_HOST_MEMORY=0` 回退。
-- **f16acc**：`llama-graph.cpp build_attn_mha`，`QWENMAX_FA_F16ACC` env 跳过上游强制 F32 累加（prefill +9%）。
+- **f16acc**：`llama-graph.cpp build_attn_mha`，`RYZENUMA_FA_F16ACC` env 跳过上游强制 F32 累加（prefill +9%）。
 - **op stats**：`build_graph` 前后 enqueue wall 累计，每 10s stderr 直方图。
 - **A/B 开关**：`GGML_VK_AMD_L_TILES`（l-tile）、`GGML_VK_GDN_CPU`；一次性 dump：memtypes / FA path / GDN 维度。
 

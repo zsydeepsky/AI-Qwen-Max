@@ -23,7 +23,7 @@ L2  服务前端     ai_qwen_max 包（FastAPI :8080）
                  ├─ OpenAI 兼容反代（/v1/*，并发闸，X-Conversation-Id 落盘）
                  ├─ Max 管理 API（/model/load /chat/* /cache/* /status ...）
                  └─ 观测流（/api/events SSE，环形缓冲 300 条）
-L1  推理引擎     llama-server（:8081 子进程，vendor/llama.cpp qwenmax 分支）
+L1  推理引擎     llama-server（:8081 子进程，vendor/llama.cpp ryzen-uma-vulkan 分支）
                  K8V8 / RAM+SSD 两级 prompt cache / MTP / checkpoint / retokenize
 ```
 
@@ -92,7 +92,7 @@ ai_qwen_max/
 
 - `scripts/build.ps1`：NMake + Vulkan-only 裁剪构建（GGML_NATIVE，关闭全部无关后端），Web UI 经 npm 构建后 C 字节数组嵌入 llama-server.exe。
 - `scripts/build_exe.ps1`：PyInstaller onedir 绿色版（`dist/max/max.exe`），入口 stub 打包时生成，收集 9 个引擎 DLL/EXE。
-- 引擎源码 = submodule `vendor/llama.cpp`（qwenmax 分支 = 上游 strix-halo-vulkan 基线 baf0025de + 单个定制 commit）。
+- 引擎源码 = submodule `vendor/llama.cpp`（ryzen-uma-vulkan 分支 = 上游 strix-halo-vulkan 基线 + Vulkan/UMA 平台优化；产品层以 `patches/qwenmax-server-layer.patch` 构建时叠加）。
 
 ## 6. 已否决技术清单（勿复入）
 

@@ -1,8 +1,9 @@
-# Engine Customization Notes (vendor/llama.cpp @ qwenmax branch)
+# Product-Layer Patch Notes (vendor/llama.cpp @ ryzen-uma-vulkan branch)
 
 [简体中文](ENGINE_PATCHES.md) ｜ **English**
 
-The `qwenmax` branch = one customization commit on top of the `strix-halo-vulkan` branch of upstream [Nathanw1014/llama.cpp](https://github.com/Nathanw1014/llama.cpp) (baseline `baf0025de`). All changes are listed by functional area for code review and upstream rebases.
+Architecture (split 2026-08-19): the engine repo is a **pure platform layer**
+([Ryzen-UMA-Vulkan-llama](https://github.com/zsydeepsky/Ryzen-UMA-Vulkan-llama), branch `ryzen-uma-vulkan` = the `strix-halo-vulkan` branch of upstream [Nathanw1014/llama.cpp](https://github.com/Nathanw1014/llama.cpp) + Vulkan/UMA platform tuning, distributable standalone). The **product-layer customizations** listed here are applied at build time via `patches/qwenmax-server-layer.patch` (see scripts/build.ps1 step 3b; regenerate with scripts/refresh-patch.ps1 after engine upgrades). All changes are listed by functional area for code review and upstream rebases.
 
 ## A. SSD prompt cache (the bulk of the customization, ~700 lines)
 
@@ -34,7 +35,7 @@ The `qwenmax` branch = one customization commit on top of the `strix-halo-vulkan
 
 - **reads_clean fast path**: `vk_device_struct.reads_clean` (atomic) + `vk_command_pool::owner_device`; UMA reads skip the per-tensor barrier+submit+fence when no submissions are in flight — a plain memcpy.
 - **memtypes**: `ggml_vk_find_memory_properties/create_buffer` gained `exclude_flags`; `prefer_host_memory` forced on by default (three-step HostCached GTT chain), fixing ~100MB/s WC readback on AMD Windows. `GGML_VK_PREFER_HOST_MEMORY=0` restores the old behavior.
-- **f16acc**: `llama-graph.cpp build_attn_mha`; the `QWENMAX_FA_F16ACC` env skips the upstream-forced F32 accumulation (prefill +9%).
+- **f16acc**: `llama-graph.cpp build_attn_mha`; the `RYZENUMA_FA_F16ACC` env skips the upstream-forced F32 accumulation (prefill +9%).
 - **op stats**: wall-time accumulation around `build_graph` enqueue; stderr histogram every 10s.
 - **A/B switches**: `GGML_VK_AMD_L_TILES` (l-tile), `GGML_VK_GDN_CPU`; one-shot dumps: memtypes / FA path / GDN dims.
 

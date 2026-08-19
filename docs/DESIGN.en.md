@@ -23,7 +23,7 @@ L2  Service front  ai_qwen_max package (FastAPI :8080)
                   ├─ OpenAI-compatible reverse proxy (/v1/*, concurrency gate, X-Conversation-Id persistence)
                   ├─ Max management API (/model/load /chat/* /cache/* /status ...)
                   └─ Observability stream (/api/events SSE, 300-entry ring buffer)
-L1  Inference      llama-server (:8081 subprocess, vendor/llama.cpp qwenmax branch)
+L1  Inference      llama-server (:8081 subprocess, vendor/llama.cpp ryzen-uma-vulkan branch)
                   K8V8 / RAM+SSD two-tier prompt cache / MTP / checkpoints / retokenize
 ```
 
@@ -92,7 +92,7 @@ Implementation notes (known pitfalls of this kind of integration, all handled he
 
 - `scripts/build.ps1`: NMake + Vulkan-only trimmed build (GGML_NATIVE, all unrelated backends off); the Web UI is built via npm and embedded into llama-server.exe as a C byte array.
 - `scripts/build_exe.ps1`: PyInstaller onedir portable build (`dist/max/max.exe`); the entry stub is generated at packaging time; collects 9 engine DLL/EXEs.
-- Engine source = submodule `vendor/llama.cpp` (qwenmax branch = upstream strix-halo-vulkan baseline baf0025de + a single customization commit).
+- Engine source = submodule `vendor/llama.cpp` (ryzen-uma-vulkan branch = upstream strix-halo-vulkan baseline + Vulkan/UMA platform tuning; product layer applied at build time via `patches/qwenmax-server-layer.patch`).
 
 ## 6. Rejected technologies (do not reintroduce)
 
