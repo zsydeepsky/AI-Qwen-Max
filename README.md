@@ -67,7 +67,7 @@ web 界面 / CLI ──┐
 | 生成段 checkpoint | 解码期每 256 token 滚动快照 + 生成结束终拍 | 中断/多轮对话不再全量重算 prefill |
 | BPE 治愈 | cache-aware retokenize（文本级 LCP + detokenize 校验） | 贪心生成与重渲染的 token 边界分歧不再击穿缓存 |
 | UMA 内存 | HostCached GTT 映射 + reads_clean 快路径 | SSM checkpoint 快照 1.4s → 40ms（45×） |
-| 注意力 | FA f16 累加（QWENMAX_FA_F16ACC） | prefill +9% |
+| 注意力 | FA f16 累加（RYZENUMA_FA_F16ACC） | prefill +9% |
 
 引擎定制明细：[docs/ENGINE_PATCHES.md](docs/ENGINE_PATCHES.md) ｜ 设计文档：[docs/DESIGN.md](docs/DESIGN.md)
 

@@ -71,7 +71,7 @@ if ($LogFile) {
 # HostCached GTT 映射：SSM checkpoint 快照 1.4s → 32-40ms（45×），warm TTFT 6.2→2.0s
 $env:GGML_VK_PREFER_HOST_MEMORY = '1'
 # fp16 注意力累加（上游保守强制 F32）：prefill +9%
-$env:QWENMAX_FA_F16ACC = '1'
+$env:RYZENUMA_FA_F16ACC = '1'
 # l-tile GEMM：驱动版本相关！2026-07 驱动 (32.0.31035.1003) 上回退 -38%，保持 '0'；
 # 驱动更新后用 llama-bench -p 2048 重新 A/B
 $env:GGML_VK_AMD_L_TILES = '0'

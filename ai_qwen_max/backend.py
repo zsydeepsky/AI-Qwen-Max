@@ -95,7 +95,7 @@ class Backend:
         env = dict(os.environ)
         # 引擎定制开关（详见 docs/ENGINE_PATCHES.md）
         env.setdefault("GGML_VK_PREFER_HOST_MEMORY", "1")   # HostCached GTT：快照恢复 45×
-        env.setdefault("QWENMAX_FA_F16ACC", "1")            # fp16 注意力累加：prefill +9%
+        env.setdefault("RYZENUMA_FA_F16ACC", "1")           # fp16 注意力累加：prefill +9%
         env.setdefault("GGML_VK_AMD_L_TILES", "0")          # 当前驱动下 l-tile 回退，保持关闭
         return env
 

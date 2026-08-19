@@ -67,7 +67,7 @@ external OpenAI clients ──┘  session mgmt / proxy / observability     │
 | Generation checkpoints | Rolling snapshot every 256 tokens during decode + final snapshot at generation end | Interruptions / multi-turn chats no longer recompute the whole prefill |
 | BPE heal | Cache-aware retokenize (text-level LCP + detokenize round-trip check) | Token-boundary divergence between greedy generation and re-rendering no longer busts the cache |
 | UMA memory | HostCached GTT mapping + reads_clean fast path | SSM checkpoint snapshot 1.4s -> 40ms (45x) |
-| Attention | FA f16 accumulation (QWENMAX_FA_F16ACC) | prefill +9% |
+| Attention | FA f16 accumulation (RYZENUMA_FA_F16ACC) | prefill +9% |
 
 Engine customization details: [docs/ENGINE_PATCHES.en.md](docs/ENGINE_PATCHES.en.md) | Design document: [docs/DESIGN.en.md](docs/DESIGN.en.md)
 
