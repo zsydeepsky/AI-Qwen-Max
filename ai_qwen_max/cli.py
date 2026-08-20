@@ -90,6 +90,7 @@ STR = {
         "log_err": "[{ts}] {method} {path} ✗ {err}",
         "log_cache": "↳ cache 命中 {c}/{t}（{pct}）",
         "snap_no_backend": "snapshot 创建失败：引擎未就绪",
+        "snap_busy": "snapshot 正在保存中，请稍候…",
         "snap_start": "snapshot 创建开始…",
         "snap_done": "snapshot 保存完成：{t} tokens · {mib:.1f} MiB · {d:.1f}s",
         "snap_fail": "snapshot 创建失败：{e}",
@@ -148,6 +149,7 @@ STR = {
         "log_err": "[{ts}] {method} {path} ✗ {err}",
         "log_cache": "↳ cache hit {c}/{t} ({pct})",
         "snap_no_backend": "snapshot create failed: engine not ready",
+        "snap_busy": "snapshot already saving, wait…",
         "snap_start": "snapshot creation started…",
         "snap_done": "snapshot saved: {t} tokens · {mib:.1f} MiB · {d:.1f}s",
         "snap_fail": "snapshot create failed: {e}",
@@ -373,25 +375,72 @@ def _read_key() -> str:
         return ch
 
 
+_APILOG_CTRLS_TS = 0.0   # Ctrl+S 防抖时间戳（time.monotonic）
+_STDOUT_LOCK = threading.Lock()   # 日志页/snapshot 输出互斥，防并发写行交错
+
+
 def _apilog_key() -> str | None:
     """非阻塞探测日志页按键：'esc'=ESC 返回，'ctrls'=Ctrl+S 创建 snapshot，None=无。
 
-    Windows 控制台 Ctrl+S 由 msvcrt 报为 0x13（DC3），与 ESC(0x1b) 区分。
+    用 ReadConsoleInputW 读原始 KEY_EVENT（键码 + Ctrl 状态），不依赖 msvcrt：
+    在 Windows Terminal/ConPTY 下 Ctrl+S 的 key-down 事件被 conhost 当 XOFF 流控
+    吞掉，只留下 key-up 事件（vk='S'，uChar=0x13），而 msvcrt.kbhit() 只认
+    key-down，永远读不到。事件级读取两者任一都能识别；一次调用消费掉缓冲内
+    全部事件。配合 _console_dc3_input 清除 ENABLE_PROCESSED_INPUT 后 0x13 才会
+    作为按键事件进入缓冲。
+
+    防抖：一次 Ctrl+S 的 key-down / key-up 可能被两次 _apilog_key 调用分别消费
+    （_create_snapshot 同步阻塞期间 key-up 积压，完成后才读到），若都返回 ctrls
+    会导致一次按键创建两次 snapshot。400ms 窗口内只算一次。
     """
+    global _APILOG_CTRLS_TS
     if sys.platform != "win32":
         return None
-    import msvcrt
-    if not msvcrt.kbhit():
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    h = k32.GetStdHandle(-10)          # STD_INPUT_HANDLE
+    if not h or h == -1:
         return None
-    ch = msvcrt.getwch()
-    if ch in ("\x00", "\xe0"):
-        msvcrt.getwch()
+
+    class _KEY(ctypes.Structure):
+        _fields_ = [("bKeyDown", wintypes.BOOL),
+                    ("wRepeatCount", wintypes.WORD),
+                    ("wVirtualKeyCode", wintypes.WORD),
+                    ("wVirtualScanCode", wintypes.WORD),
+                    ("uChar", ctypes.c_wchar),
+                    ("dwControlKeyState", wintypes.DWORD)]
+
+    class _REC(ctypes.Structure):
+        _anonymous_ = ("Event",)
+        _fields_ = [("EventType", wintypes.WORD),
+                    ("Event", _KEY)]
+
+    n = wintypes.DWORD()
+    if not k32.GetNumberOfConsoleInputEvents(h, ctypes.byref(n)) or n.value == 0:
         return None
-    if ch == "\x1b":
-        return "esc"
-    if ch == "\x13":                       # Ctrl+S
-        return "ctrls"
-    return None
+    hit = None
+    # 逐个消费事件；非目标键一并丢弃防积压。ESC / Ctrl+S 只记一次，避免 down/up 双触发。
+    for _ in range(int(n.value)):
+        rec = _REC()
+        got = wintypes.DWORD()
+        if not k32.ReadConsoleInputW(h, ctypes.byref(rec), 1, ctypes.byref(got)) or got.value == 0:
+            break
+        if rec.EventType != 1:         # KEY_EVENT
+            continue
+        k = rec.Event
+        if k.wVirtualKeyCode == 0x1B:  # ESC
+            hit = "esc"
+        elif (k.dwControlKeyState & (0x0008 | 0x0004)) and \
+                (k.wVirtualKeyCode == 0x53 or k.uChar == "\x13"):
+            hit = "ctrls"              # Ctrl+S（key-down 或 key-up 任一）
+    if hit == "ctrls":
+        now = time.monotonic()
+        if now - _APILOG_CTRLS_TS < 0.4:
+            hit = None                 # 同一按键的 down/up 双事件：只算一次
+        else:
+            _APILOG_CTRLS_TS = now
+    return hit
 
 
 class InterruptPoller:
@@ -1082,9 +1131,10 @@ class Cli:
     def _apilog_pump(self, events, cols: int) -> None:
         while True:
             for rec in events.drain_log():
-                for s in self._event_lines(rec):
-                    sys.stdout.write(self._fit_line(s, cols) + "\n")
-                sys.stdout.flush()
+                with _STDOUT_LOCK:
+                    for s in self._event_lines(rec):
+                        sys.stdout.write(self._fit_line(s, cols) + "\n")
+                    sys.stdout.flush()
             for _ in range(10):
                 key = _apilog_key()
                 if key == "esc":
@@ -1101,37 +1151,46 @@ class Cli:
         长 TTL 过期（默认 30 天，config 可调）。开始与完成都在日志中提示。
         """
         backend = getattr(self, "backend", None)
+        if getattr(self, "_snap_busy", False):
+            # 正在保存中：防连按 Ctrl+S 重复创建（一次保存可能耗时数十秒）
+            self._snap_line(self.L("snap_busy"), cols, warn=True)
+            return
         t0 = time.time()
         if backend is None or not getattr(backend, "healthy", False):
             self._snap_line(self.L("snap_no_backend"), cols, warn=True)
             return
-        self._snap_line(self.L("snap_start"), cols)
+        self._snap_busy = True
         try:
-            resp = backend.post("/snapshot/create", timeout=600)
-        except Exception as e:
-            self._snap_line(self.L("snap_fail", e=str(e)), cols, warn=True)
-            return
-        dur = time.time() - t0
-        if resp.status_code == 200:
+            self._snap_line(self.L("snap_start"), cols)
             try:
-                data = resp.json()
-                ok = data.get("ok")
-                toks = data.get("tokens", 0)
-                nbytes = data.get("bytes", 0)
-            except ValueError:
-                ok, toks, nbytes = None, 0, 0
-            if ok:
-                self._snap_line(self.L("snap_done", t=toks, mib=nbytes / (1024.0 * 1024.0), d=dur), cols)
+                resp = backend.post("/snapshot/create", timeout=600)
+            except Exception as e:
+                self._snap_line(self.L("snap_fail", e=str(e)), cols, warn=True)
+                return
+            dur = time.time() - t0
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    ok = data.get("ok")
+                    toks = data.get("tokens", 0)
+                    nbytes = data.get("bytes", 0)
+                except ValueError:
+                    ok, toks, nbytes = None, 0, 0
+                if ok:
+                    self._snap_line(self.L("snap_done", t=toks, mib=nbytes / (1024.0 * 1024.0), d=dur), cols)
+                else:
+                    err = data.get("error", "unknown") if isinstance(data, dict) else "unknown"
+                    self._snap_line(self.L("snap_fail", e=err), cols, warn=True)
             else:
-                err = data.get("error", "unknown") if isinstance(data, dict) else "unknown"
-                self._snap_line(self.L("snap_fail", e=err), cols, warn=True)
-        else:
-            self._snap_line(self.L("snap_fail_http", s=resp.status_code), cols, warn=True)
+                self._snap_line(self.L("snap_fail_http", s=resp.status_code), cols, warn=True)
+        finally:
+            self._snap_busy = False
 
     def _snap_line(self, text: str, cols: int, warn: bool = False) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] " + (f"{_YELLOW}{text}{_RESET}" if warn else text)
-        sys.stdout.write(self._fit_line(line, cols) + "\n")
-        sys.stdout.flush()
+        with _STDOUT_LOCK:
+            sys.stdout.write(self._fit_line(line, cols) + "\n")
+            sys.stdout.flush()
 
     @staticmethod
     def _fit_line(s: str, cols: int) -> str:
